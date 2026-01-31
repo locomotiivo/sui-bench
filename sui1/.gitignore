@@ -1,0 +1,12 @@
+scripts/node_modules/*
+scripts/.env*
+scripts/*config*.json
+scripts/log/*
+minimal_test/build/*
+minimal_test/traces/*
+minimal_test/.coverage*
+minimal_test/.trace
+tps_test/build/*
+tps_test/traces/*
+tps_test/.trace
+tps_test/.coverage*

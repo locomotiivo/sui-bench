@@ -1,0 +1,21 @@
+{
+  "name": "ts-bench",
+  "version": "1.0.0",
+  "description": "SUI Device Write Benchmark",
+  "type": "module",
+  "main": "dist/benchmark.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --loader ts-node/esm src/benchmark.ts",
+    "bench": "node --loader ts-node/esm src/benchmark.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@mysten/sui": "^2.1.0",
+    "@types/node": "^25.1.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

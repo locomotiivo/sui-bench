@@ -1,0 +1,25 @@
+---
+keystore:
+  File: sui.keystore
+external_keys: ~
+envs:
+  - alias: testnet
+    rpc: "https://fullnode.testnet.sui.io:443"
+    ws: ~
+    basic_auth: ~
+    chain_id: 4c78adac
+  - alias: mainnet
+    rpc: "https://fullnode.mainnet.sui.io:443"
+    ws: ~
+    basic_auth: ~
+    chain_id: 35834a8a
+  - alias: devnet
+    rpc: "https://fullnode.devnet.sui.io:443"
+    ws: ~
+    basic_auth: ~
+  - alias: local
+    rpc: "http://127.0.0.1:9000"
+    ws: ~
+    basic_auth: ~
+active_env: testnet
+active_address: "0xda4fe585f525a9e013122f3360431c4358121ffc8e6fcae37226921064839cc1"
