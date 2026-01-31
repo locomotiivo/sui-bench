@@ -9,4 +9,4 @@ Sui = { local = "/home/femu/sui/crates/sui-framework/packages/sui-framework" }
 bloat_storage = "0x0"
 
 [environments]
-localnet = "9fd46431"
+localnet = "3390c594"

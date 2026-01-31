@@ -1,13 +1,13 @@
 module bloat_storage::bloat {
-    use sui::object::UID;
-    use sui::tx_context::TxContext;
+    use sui::object;
+    use sui::tx_context;
     use sui::transfer;
     use std::vector;
     use std::hash;
 
     /// Large storage blob - configurable size
     public struct Blob has key, store {
-        id: UID,
+        id: object::UID,
         data: vector<u8>,        // Main payload
         metadata: vector<u8>,    // Extra metadata
         counter: u64,
@@ -45,7 +45,7 @@ module bloat_storage::bloat {
 
     /// Create blob with INCOMPRESSIBLE random data (for storage bloat testing)
     /// Uses tx digest hash + epoch + counter as seed for pseudo-random generation
-    public entry fun create_blob(size_kb: u64, ctx: &mut TxContext) {
+    public entry fun create_blob(size_kb: u64, ctx: &mut tx_context::TxContext) {
         let bytes = size_kb * 1024;
         
         // Create unique seed from transaction context
@@ -84,7 +84,7 @@ module bloat_storage::bloat {
     }
     
     /// Legacy: Create blob with compressible pattern (for comparison)
-    public entry fun create_blob_compressible(size_kb: u64, ctx: &mut TxContext) {
+    public entry fun create_blob_compressible(size_kb: u64, ctx: &mut tx_context::TxContext) {
         let bytes = size_kb * 1024;
         let mut data = vector::empty<u8>();
         let mut i = 0;
@@ -110,7 +110,7 @@ module bloat_storage::bloat {
     public entry fun create_blobs_batch(
         size_kb: u64, 
         count: u64, 
-        ctx: &mut TxContext
+        ctx: &mut tx_context::TxContext
     ) {
         let mut i = 0;
         while (i < count) {
@@ -120,7 +120,7 @@ module bloat_storage::bloat {
     }
 
     /// Update blob with INCOMPRESSIBLE random data (creates new version = storage churn)
-    public entry fun update_blob(blob: &mut Blob, new_size_kb: u64, ctx: &mut TxContext) {
+    public entry fun update_blob(blob: &mut Blob, new_size_kb: u64, ctx: &mut tx_context::TxContext) {
         let bytes = new_size_kb * 1024;
         
         // Generate new random seed from context
@@ -151,7 +151,7 @@ module bloat_storage::bloat {
     public entry fun create_varied_blobs(
         base_size_kb: u64,
         count: u64,
-        ctx: &mut TxContext
+        ctx: &mut tx_context::TxContext
     ) {
         let mut i = 0;
         while (i < count) {
