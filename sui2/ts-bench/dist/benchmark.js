@@ -49,51 +49,42 @@ function getDeviceBytesWritten() {
 }
 function formatBytes(bytes) {
     if (bytes >= 1024 * 1024 * 1024) {
-        return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
     }
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    else {
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
 }
-function formatRate(bytesPerSec) {
-    const mbPerMin = (bytesPerSec * 60) / 1024 / 1024;
-    const gbPerMin = mbPerMin / 1024;
-    return `${mbPerMin.toFixed(0)} MB/min (${gbPerMin.toFixed(2)} GB/min)`;
+function log(message) {
+    console.log(`[${new Date().toLocaleTimeString()}] ${message}`);
 }
-// Load keypair from SUI config
-function loadKeypair() {
+// Load SUI configuration
+function loadSuiConfig() {
     const configPath = path.join(CONFIG.suiConfigDir, "client.yaml");
-    const content = fs.readFileSync(configPath, "utf-8");
-    // Parse keystore path from client.yaml
-    const keystoreMatch = content.match(/keystore:\s*\n\s+File:\s+(.+)/);
-    if (!keystoreMatch) {
-        throw new Error("Could not find keystore path in client.yaml");
+    if (!fs.existsSync(configPath)) {
+        throw new Error(`SUI config not found at: ${configPath}`);
     }
-    const keystorePath = keystoreMatch[1].trim();
-    const keystoreContent = fs.readFileSync(keystorePath, "utf-8");
-    const keys = JSON.parse(keystoreContent);
-    if (keys.length === 0) {
-        throw new Error("No keys in keystore");
+    const config = fs.readFileSync(configPath, "utf-8");
+    const privateKeyMatch = config.match(/privkey:\s*(.+)/);
+    if (!privateKeyMatch) {
+        throw new Error("Private key not found in client.yaml");
     }
-    // First key is typically the active one
-    const keyBase64 = keys[0];
-    const keyBytes = Buffer.from(keyBase64, "base64");
-    // The stored key includes a 1-byte flag prefix
-    const secretKey = keyBytes.slice(1, 33);
-    return Ed25519Keypair.fromSecretKey(secretKey);
+    return privateKeyMatch[1].trim();
 }
-// Get package ID from saved file
-function getPackageId() {
+// Load package ID
+function loadPackageId() {
     const packageIdPath = path.join(CONFIG.suiConfigDir, ".package_id");
     if (!fs.existsSync(packageIdPath)) {
-        throw new Error(`Package ID not found at ${packageIdPath}. Run sui-benchmark.sh first.`);
+        throw new Error(`Package ID file not found: ${packageIdPath}. Run deploy script first.`);
     }
     return fs.readFileSync(packageIdPath, "utf-8").trim();
 }
-// Worker that continuously sends transactions
-async function worker(client, keypair, packageId, workerId, endTime) {
-    const address = keypair.toSuiAddress();
-    while (Date.now() < endTime) {
+// Worker function - runs transactions in a loop
+async function worker(workerId, client, keypair, packageId) {
+    log(`Worker ${workerId} started`);
+    while (true) {
         try {
-            // Build transaction
+            // Create transaction to call create_blobs_batch
             const tx = new Transaction();
             tx.moveCall({
                 target: `${packageId}::bloat::create_blobs_batch`,
@@ -102,9 +93,7 @@ async function worker(client, keypair, packageId, workerId, endTime) {
                     tx.pure.u64(CONFIG.batchCount),
                 ],
             });
-            tx.setGasBudget(5000000000);
-            stats.txSubmitted++;
-            // Execute transaction
+            // Sign and execute
             const result = await client.signAndExecuteTransaction({
                 transaction: tx,
                 signer: keypair,
@@ -114,111 +103,86 @@ async function worker(client, keypair, packageId, workerId, endTime) {
             });
             if (result.effects?.status?.status === "success") {
                 stats.txSuccess++;
-                stats.bytesWrittenApp += CONFIG.blobSizeKb * 1024 * CONFIG.batchCount;
+                stats.bytesWrittenApp += CONFIG.blobSizeKb * CONFIG.batchCount * 1024;
             }
             else {
                 stats.txFailed++;
-                // Don't log every failure to avoid spam
+                log(`Worker ${workerId}: TX failed: ${result.effects?.status?.error}`);
             }
         }
-        catch (e) {
+        catch (error) {
             stats.txFailed++;
-            // Log occasional errors
-            if (stats.txFailed % 100 === 1) {
-                console.log(`[Worker ${workerId}] Error: ${e.message?.substring(0, 100)}`);
-            }
+            log(`Worker ${workerId}: Error: ${error}`);
         }
+        stats.txSubmitted++;
+        // Small delay to prevent overwhelming the node
+        await new Promise(resolve => setTimeout(resolve, 10));
     }
 }
-// Print current stats
-function printStats() {
-    const now = Date.now();
-    const elapsed = (now - stats.startTime) / 1000;
-    const currentDeviceBytes = getDeviceBytesWritten();
-    const deviceWritten = currentDeviceBytes - stats.startDeviceBytes;
-    const deviceRate = deviceWritten / elapsed;
-    const appWritten = stats.bytesWrittenApp;
-    const wa = appWritten > 0 ? deviceWritten / appWritten : 0;
-    console.log(`\n[${new Date().toTimeString().split(" ")[0]}] --- Stats after ${elapsed.toFixed(0)}s ---`);
-    console.log(`  Txs: ${stats.txSubmitted} (Success: ${stats.txSuccess}, Failed: ${stats.txFailed})`);
-    console.log(`  App Written:    ${formatBytes(appWritten)} (blob data)`);
-    console.log(`  Device Written: ${formatBytes(deviceWritten)} (actual I/O)`);
-    console.log(`  Device Rate:    ${formatRate(deviceRate)}`);
-    console.log(`  Write Amp:      ${wa.toFixed(2)}x`);
+// Monitor function - prints stats every 10 seconds
+async function monitor() {
+    const startTime = Date.now();
+    const startDeviceBytes = getDeviceBytesWritten();
+    while (true) {
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        const elapsedSec = (Date.now() - startTime) / 1000;
+        const currentDeviceBytes = getDeviceBytesWritten();
+        const deviceBytesDelta = currentDeviceBytes - startDeviceBytes;
+        const deviceRateMBMin = (deviceBytesDelta / elapsedSec) * 60 / (1024 * 1024);
+        const writeAmp = stats.bytesWrittenApp > 0 ? deviceBytesDelta / stats.bytesWrittenApp : 0;
+        log(`After ${elapsedSec.toFixed(0)}s: Txs=${stats.txSubmitted} (ok=${stats.txSuccess}, fail=${stats.txFailed})`);
+        log(`  Device: ${formatBytes(deviceBytesDelta)}, Rate=${deviceRateMBMin.toFixed(0)} MB/min`);
+        log(`  App: ${formatBytes(stats.bytesWrittenApp)}, WA=${writeAmp.toFixed(2)}x`);
+    }
 }
+// Main function
 async function main() {
-    console.log("═══════════════════════════════════════════════════════════════");
-    console.log("  DEVICE WRITE BENCHMARK - TypeScript SDK Version");
-    console.log("═══════════════════════════════════════════════════════════════");
-    console.log("");
-    // Load configuration
-    const packageId = getPackageId();
-    const keypair = loadKeypair();
-    const address = keypair.toSuiAddress();
-    console.log(`  Package:    ${packageId}`);
-    console.log(`  Address:    ${address}`);
-    console.log(`  Workers:    ${CONFIG.workers}`);
-    console.log(`  Duration:   ${CONFIG.durationSec}s`);
-    console.log(`  Per TX:     ${CONFIG.blobSizeKb}KB × ${CONFIG.batchCount} = ${(CONFIG.blobSizeKb * CONFIG.batchCount / 1024).toFixed(0)}MB`);
-    console.log(`  Device:     /dev/${CONFIG.nvmeDevice}`);
-    console.log("");
-    // Initialize client
-    const client = new SuiClient({ url: CONFIG.rpcUrl });
-    // Test connection
+    log("SUI Device Write Benchmark (TypeScript SDK)");
+    log(`Configuration:`);
+    log(`  RPC: ${CONFIG.rpcUrl}`);
+    log(`  Workers: ${CONFIG.workers}`);
+    log(`  Duration: ${CONFIG.durationSec}s`);
+    log(`  Per TX: ${CONFIG.blobSizeKb}KB × ${CONFIG.batchCount} = ${(CONFIG.blobSizeKb * CONFIG.batchCount / 1024).toFixed(1)}MB`);
+    log(`  Device: ${CONFIG.nvmeDevice}`);
+    log("");
     try {
-        await client.getLatestCheckpointSequenceNumber();
-        console.log("  ✓ Connected to SUI node");
+        // Initialize SUI client
+        const client = new SuiClient({ url: CONFIG.rpcUrl });
+        // Load configuration
+        const privateKey = loadSuiConfig();
+        const keypair = Ed25519Keypair.fromSecretKey(privateKey);
+        const packageId = loadPackageId();
+        log(`Package ID: ${packageId}`);
+        log(`Address: ${keypair.getPublicKey().toSuiAddress()}`);
+        log("");
+        // Initialize stats
+        stats.startDeviceBytes = getDeviceBytesWritten();
+        stats.startTime = Date.now();
+        // Start monitor
+        monitor();
+        // Start workers
+        const workers = [];
+        for (let i = 0; i < CONFIG.workers; i++) {
+            workers.push(worker(i, client, keypair, packageId));
+        }
+        // Wait for duration
+        await new Promise(resolve => setTimeout(resolve, CONFIG.durationSec * 1000));
+        // Stop workers (they will exit when the process ends)
+        process.exit(0);
     }
-    catch (e) {
-        console.error("  ✗ Failed to connect to SUI node at", CONFIG.rpcUrl);
+    catch (error) {
+        log(`Error: ${error}`);
         process.exit(1);
     }
-    // Record baseline
-    stats.startDeviceBytes = getDeviceBytesWritten();
-    stats.startTime = Date.now();
-    const endTime = stats.startTime + CONFIG.durationSec * 1000;
-    console.log(`  Initial device writes: ${formatBytes(stats.startDeviceBytes)}`);
-    console.log("");
-    console.log(`Starting ${CONFIG.workers} workers...`);
-    // Start workers
-    const workers = [];
-    for (let i = 0; i < CONFIG.workers; i++) {
-        workers.push(worker(client, keypair, packageId, i, endTime));
-    }
-    // Print stats every 5 seconds
-    const statsInterval = setInterval(printStats, 5000);
-    // Wait for all workers to complete
-    await Promise.all(workers);
-    clearInterval(statsInterval);
-    // Final stats
-    const totalElapsed = (Date.now() - stats.startTime) / 1000;
-    const finalDeviceBytes = getDeviceBytesWritten();
-    const totalDeviceWritten = finalDeviceBytes - stats.startDeviceBytes;
-    const avgRate = totalDeviceWritten / totalElapsed;
-    const avgRateMbMin = (avgRate * 60) / 1024 / 1024;
-    const avgRateGbMin = avgRateMbMin / 1024;
-    console.log("\n═══════════════════════════════════════════════════════════════");
-    console.log("  BENCHMARK COMPLETE");
-    console.log("═══════════════════════════════════════════════════════════════");
-    console.log("");
-    console.log(`  Duration:         ${totalElapsed.toFixed(1)}s`);
-    console.log(`  Workers:          ${CONFIG.workers}`);
-    console.log(`  Transactions:     ${stats.txSuccess} successful / ${stats.txSubmitted} total`);
-    console.log("");
-    console.log("  ─── DEVICE WRITES (actual SSD I/O) ───");
-    console.log(`  Total Written:    ${formatBytes(totalDeviceWritten)}`);
-    console.log(`  Write Rate:       ${formatRate(avgRate)}`);
-    console.log("");
-    console.log("  Target for FDP GC: 5-10 GB/min");
-    if (avgRateMbMin >= 5120) {
-        console.log("  Status:           ✓ TARGET ACHIEVED!");
-    }
-    else if (avgRateMbMin >= 2048) {
-        console.log("  Status:           ~ Close to target");
-    }
-    else {
-        console.log("  Status:           ✗ Need more throughput");
-    }
-    console.log("");
 }
+// Handle graceful shutdown
+process.on("SIGINT", () => {
+    log("Shutting down...");
+    process.exit(0);
+});
+process.on("SIGTERM", () => {
+    log("Shutting down...");
+    process.exit(0);
+});
+// Run the benchmark
 main().catch(console.error);

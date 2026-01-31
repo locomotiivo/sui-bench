@@ -14,7 +14,9 @@
 #   2. Starts Sui validator with FDP-aware placement
 #   3. Starts the epoch watcher (FDP_MODE=1 only)
 #   4. Starts the storage monitor
-#   5. Runs the benchmark workload
+#   5. Funds the benchmark account
+#   6. Publishes the Move contract
+#   7. Runs the benchmark workload
 
 set -e
 
@@ -24,7 +26,7 @@ MOUNT_POINT="${MOUNT_POINT:-$HOME/f2fs_fdp_mount}"
 # Auto-detect project root from script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/log}"
+RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/log}"
 
 # Export for child scripts
 export SUI_DISABLE_GAS
@@ -88,7 +90,7 @@ log "║  Gas Disabled: $([ \"$SUI_DISABLE_GAS\" = \"1\" ] && echo 'YES (max thr
 log "╚═══════════════════════════════════════════════════════════════╝"
 log ""
 
-log "[1/5] Starting Sui node with FDP storage..."
+log "[1/7] Starting Sui node with FDP storage..."
 RESULTS_DIR="$RESULTS_DIR" "$SCRIPT_DIR/start-node.sh" 2>&1 | tee "$RESULTS_DIR/startup.log"
 
 # start-node.sh exits when node is ready (or fails), no additional wait needed
@@ -98,7 +100,7 @@ log "✓ Node startup complete"
 # Step 2: Start epoch watcher (FDP mode only)
 # ============================================================
 log ""
-log "[2/5] Starting epoch watcher..."
+log "[2/7] Starting epoch watcher..."
 
 if [ "$FDP_MODE" -eq 1 ]; then
     CONFIG_DIR="$MOUNT_POINT/p0/sui_node" "$SCRIPT_DIR/fdp-epoch-watcher.sh" watch > "$RESULTS_DIR/epoch_watcher.log" 2>&1 &
@@ -112,7 +114,7 @@ fi
 # Step 3: Start storage monitor
 # ============================================================
 log ""
-log "[3/5] Starting storage monitor..."
+log "[3/7] Starting storage monitor..."
 
 # Set SUI_CONFIG_DIR early (needed by fund-account.sh and benchmark)
 SUI_CONFIG_DIR="${SUI_CONFIG_DIR:-$MOUNT_POINT/p0/sui_node}"
@@ -126,20 +128,71 @@ log "✓ Storage monitor started (PID: $MONITOR_PID)"
 # Step 4: Fund the benchmark account
 # ============================================================
 log ""
-log "[4/5] Funding benchmark account..."
+log "[4/7] Funding benchmark account..."
 
 if [ -f "$SCRIPT_DIR/fund-account.sh" ]; then
-    "$SCRIPT_DIR/fund-account.sh" 2>&1 | tee "$RESULTS_DIR/funding.log" || true
+    SUI_CONFIG_DIR="$SUI_CONFIG_DIR" "$SCRIPT_DIR/fund-account.sh" 2>&1 | tee "$RESULTS_DIR/funding.log" || true
     log "✓ Account funded"
 else
     log "  Skipped (fund-account.sh not found)"
 fi
 
 # ============================================================
+# Step 5: Publish Move contract
+# ============================================================
+log ""
+log "[5/7] Publishing Move contract..."
+
+# First, verify node is still running
+log "Checking if node is responding..."
+if ! curl -s --max-time 5 http://127.0.0.1:9000 -d '{"jsonrpc":"2.0","id":1,"method":"sui_getLatestCheckpointSequenceNumber"}' -H 'Content-Type: application/json' >/dev/null 2>&1; then
+    log "ERROR: Node RPC is not responding"
+    exit 1
+fi
+log "✓ Node RPC is responding"
+
+MOVE_DIR="$PROJECT_ROOT/move/bloat_storage"
+if [ -d "$MOVE_DIR" ]; then
+    log "Publishing contract from: $MOVE_DIR"
+    cd "$MOVE_DIR"
+    
+    # Ensure sui client uses the correct config
+    export SUI_CONFIG_DIR="$SUI_CONFIG_DIR"
+    
+    log "Using config dir: $SUI_CONFIG_DIR"
+    
+    # Clear any cached publication files to avoid chain ID conflicts
+    rm -f Pub.localnet.toml Pub.testnet.toml 2>/dev/null || true
+    
+    # Publish using test-publish for local network
+    log "Running: sui client test-publish --build-env localnet --json"
+    set +e  # Temporarily disable exit on error
+    PUBLISH_OUTPUT=$(sui client test-publish --build-env localnet --json 2>&1)
+    PUBLISH_EXIT_CODE=$?
+    set -e  # Re-enable exit on error
+    
+    log "Publish exit code: $PUBLISH_EXIT_CODE"
+    
+    if [ $PUBLISH_EXIT_CODE -eq 0 ] && echo "$PUBLISH_OUTPUT" | jq -e '.effects.V2.status == "Success"' >/dev/null 2>&1; then
+        PACKAGE_ID=$(echo "$PUBLISH_OUTPUT" | jq -r '.effects.V2.changed_objects[] | select(.objectType == "package") | .objectId')
+        echo "$PACKAGE_ID" > "$SUI_CONFIG_DIR/.package_id"
+        log "✓ Contract published: $PACKAGE_ID"
+    else
+        log "ERROR: Failed to publish contract (exit code: $PUBLISH_EXIT_CODE)"
+        log "Publish output:"
+        echo "$PUBLISH_OUTPUT" | head -20
+        exit 1
+    fi
+else
+    log "ERROR: Move directory not found: $MOVE_DIR"
+    exit 1
+fi
+
+# ============================================================
 # Step 5: Run benchmark workload
 # ============================================================
 log ""
-log "[5/5] Starting benchmark workload..."
+log "[6/7] Starting benchmark workload..."
 log ""
 
 log "================================================================"
@@ -161,153 +214,30 @@ if [ -n "$BENCH_SCRIPT" ] && [ -f "$BENCH_SCRIPT" ]; then
     log "Found benchmark script: $BENCH_SCRIPT"
     
     # Export config for the benchmark
+    # Note: sui-benchmark.sh handles chain ID injection into Move.toml automatically
+    export SUI_CONFIG_DIR="$SUI_CONFIG_DIR"
     export MOVE_DIR="$PROJECT_ROOT/move/bloat_storage"
     
-    # Benchmark parameters (batch mode: 50 blobs x 200KB = 10MB per tx for max device writes)
+    # Benchmark parameters (batch mode: 10 blobs x 200KB = 2MB per tx)
     export BLOB_SIZE_KB="${BLOB_SIZE_KB:-200}"       # Max 200KB per blob (Move limit)
-    export BATCH_COUNT="${BATCH_COUNT:-50}"          # 50 blobs per tx = 10MB per tx
-    export PARALLEL="${PARALLEL:-32}"                # 32 workers
-    export WORKERS="${WORKERS:-$PARALLEL}"           # Alias for max-device-write-bench.sh
-    export DURATION="${DURATION:-300}"               # 5 minutes default
-    export DURATION_SECONDS="${DURATION_SECONDS:-$DURATION}"
+    export BATCH_COUNT="${BATCH_COUNT:-10}"          # 10 blobs per tx = 2MB per tx
+    export PARALLEL="${PARALLEL:-32}"                # 32 workers for ~1.3 GB/min
+    export DURATION_SECONDS="${DURATION_SECONDS:-0}" # 0 = run until Ctrl+C
+    
+    # Clear any cached package ID to force re-publish with correct chain ID
+    rm -f "$SUI_CONFIG_DIR/.package_id" 2>/dev/null || true
     
     log ""
     log "Benchmark settings:"
     log "  BLOB_SIZE_KB=$BLOB_SIZE_KB (max per blob)"
-    log "  BATCH_COUNT=$BATCH_COUNT blobs/tx ($(($BLOB_SIZE_KB * $BATCH_COUNT / 1024))MB per tx)"
-    log "  WORKERS=$WORKERS"
-    log "  DURATION=$DURATION seconds"
+    log "  BATCH_COUNT=$BATCH_COUNT blobs/tx ($(($BLOB_SIZE_KB * $BATCH_COUNT))KB per tx)"
+    log "  PARALLEL=$PARALLEL workers"
+    log "  DURATION_SECONDS=$DURATION_SECONDS (0=infinite)"
     log "  MOVE_DIR=$MOVE_DIR"
     log ""
     
-    # ============================================================
-    # Publish Move contract if not already published
-    # ============================================================
-    PACKAGE_ID_FILE="$SUI_CONFIG_DIR/.package_id"
-    if [ ! -f "$PACKAGE_ID_FILE" ] || [ ! -s "$PACKAGE_ID_FILE" ]; then
-        log "Publishing Move contract..."
-        
-        # Verify MOVE_DIR exists
-        if [ ! -d "$MOVE_DIR" ]; then
-            log "  ERROR: Move directory not found: $MOVE_DIR"
-            exit 1
-        fi
-        
-        # Get chain ID and update Move.toml
-        CHAIN_ID=$(curl -s http://127.0.0.1:9000 -d '{"jsonrpc":"2.0","id":1,"method":"sui_getChainIdentifier"}' -H 'Content-Type: application/json' | grep -oP '"result"\s*:\s*"\K[^"]+' || echo "")
-        if [ -n "$CHAIN_ID" ] && [ -f "$MOVE_DIR/Move.toml" ]; then
-            log "  Chain ID: $CHAIN_ID"
-            sed -i "s/published-at = \"0x[^\"]*\"/published-at = \"0x0\"/" "$MOVE_DIR/Move.toml" 2>/dev/null || true
-            # Remove any existing [addresses] section chain-specific entries
-            sed -i '/^\[addresses\]/,/^\[/{/chain_id/d}' "$MOVE_DIR/Move.toml" 2>/dev/null || true
-            
-            # Add [environments] section for localnet if not present
-            if ! grep -q "^\[environments\]" "$MOVE_DIR/Move.toml"; then
-                echo "" >> "$MOVE_DIR/Move.toml"
-                echo "[environments]" >> "$MOVE_DIR/Move.toml"
-            fi
-            # Update or add localnet environment with current chain ID
-            if grep -q "^localnet\s*=" "$MOVE_DIR/Move.toml"; then
-                sed -i "s/^localnet\s*=.*/localnet = \"$CHAIN_ID\"/" "$MOVE_DIR/Move.toml"
-            else
-                echo "localnet = \"$CHAIN_ID\"" >> "$MOVE_DIR/Move.toml"
-            fi
-            log "  Updated Move.toml with localnet environment"
-        fi
-        
-        # Remove old ephemeral publication file (has stale chain ID)
-        rm -f "$MOVE_DIR/Pub.localnet.toml" 2>/dev/null || true
-        
-        # Publish the contract using test-publish (creates ephemeral publication)
-        SAVED_DIR="$(pwd)"
-        cd "$MOVE_DIR" || { log "  ERROR: Cannot cd to $MOVE_DIR"; exit 1; }
-        
-        log "  Running: sui client test-publish --build-env localnet --gas-budget 500000000 --json"
-        set +e
-        PUBLISH_OUTPUT=$(sui client test-publish --build-env localnet --gas-budget 500000000 --json 2>&1)
-        PUBLISH_EXIT=$?
-        set -e
-        cd "$SAVED_DIR"
-        
-        if [ $PUBLISH_EXIT -ne 0 ]; then
-            log "  ERROR: sui client publish failed (exit $PUBLISH_EXIT)"
-            log "  Output: $PUBLISH_OUTPUT"
-            exit 1
-        fi
-        
-        # Extract package ID - first try from JSON output
-        PACKAGE_ID=$(echo "$PUBLISH_OUTPUT" | grep -oP '"packageId"\s*:\s*"\K0x[a-fA-F0-9]+' | head -1)
-        
-        if [ -z "$PACKAGE_ID" ]; then
-            # Try alternative JSON extraction
-            PACKAGE_ID=$(echo "$PUBLISH_OUTPUT" | grep -oP '"objectId"\s*:\s*"\K0x[a-fA-F0-9]+' | head -1)
-        fi
-        
-        if [ -z "$PACKAGE_ID" ]; then
-            # Extract from Pub.localnet.toml which test-publish creates
-            if [ -f "$MOVE_DIR/Pub.localnet.toml" ]; then
-                PACKAGE_ID=$(grep "^published-at" "$MOVE_DIR/Pub.localnet.toml" | grep -oP '0x[a-fA-F0-9]+' | head -1)
-                log "  Extracted package ID from Pub.localnet.toml"
-            fi
-        fi
-        
-        if [ -n "$PACKAGE_ID" ]; then
-            echo "$PACKAGE_ID" > "$PACKAGE_ID_FILE"
-            log "  ✓ Package published: $PACKAGE_ID"
-        else
-            log "  ERROR: Failed to extract package ID"
-            log "  Output: $PUBLISH_OUTPUT"
-            if [ -f "$MOVE_DIR/Pub.localnet.toml" ]; then
-                log "  Pub.localnet.toml:"
-                cat "$MOVE_DIR/Pub.localnet.toml"
-            fi
-            exit 1
-        fi
-        cd - > /dev/null
-    else
-        PACKAGE_ID=$(cat "$PACKAGE_ID_FILE")
-        log "Using existing package: $PACKAGE_ID"
-    fi
-    export PACKAGE_ID
-    
-    # Record initial FDP/device stats
-    if [ -f "$SCRIPT_DIR/fdp-stats.sh" ]; then
-        log "Recording initial FDP stats..."
-        STATS_DIR="$RESULTS_DIR" "$SCRIPT_DIR/fdp-stats.sh" start 2>&1 | tee "$RESULTS_DIR/fdp_stats_start.log"
-    fi
-    
-    # Mark that we're starting the benchmark - cleanup node on exit from this point
-    CLEANUP_NODE_ON_EXIT=1
-    
     # Start the benchmark
-    BENCH_START_TIME=$(date +%s)
     "$BENCH_SCRIPT" 2>&1 | tee "$RESULTS_DIR/benchmark.log"
-    BENCH_END_TIME=$(date +%s)
-    
-    # Record final FDP/device stats and calculate WAF
-    if [ -f "$SCRIPT_DIR/fdp-stats.sh" ]; then
-        log ""
-        log "Recording final FDP stats..."
-        STATS_DIR="$RESULTS_DIR" "$SCRIPT_DIR/fdp-stats.sh" stop 2>&1 | tee "$RESULTS_DIR/fdp_stats_final.log"
-    fi
-    
-    # Print final summary
-    BENCH_DURATION=$((BENCH_END_TIME - BENCH_START_TIME))
-    log ""
-    log "════════════════════════════════════════════════════════════════"
-    log "  BENCHMARK SUMMARY"
-    log "════════════════════════════════════════════════════════════════"
-    log "  Total Duration: ${BENCH_DURATION}s"
-    log "  FDP Mode:       $FDP_MODE"
-    log "  Results Dir:    $RESULTS_DIR"
-    if [ -f "$RESULTS_DIR/results.txt" ]; then
-        log ""
-        log "  Device Stats (from $RESULTS_DIR/results.txt):"
-        cat "$RESULTS_DIR/results.txt" | while read line; do
-            log "    $line"
-        done
-    fi
-    log "════════════════════════════════════════════════════════════════"
     
 # Fall back to Node.js server if available
 elif [ -d "$PROJECT_ROOT/server" ] && [ -f "$PROJECT_ROOT/server/package.json" ]; then
@@ -368,4 +298,3 @@ else
         fi
     done
 fi
-

@@ -29,7 +29,7 @@ set -e
 
 FDP_MODE="${FDP_MODE:-0}"
 SUI_DISABLE_GAS="${SUI_DISABLE_GAS:-0}"
-EPOCH_DURATION_MS="${EPOCH_DURATION_MS:-10000}"  # Default: 10 seconds
+EPOCH_DURATION_MS="${EPOCH_DURATION_MS:-60000}"
 
 # Auto-detect project root from script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,11 +49,9 @@ kill_all_sui() {
     pkill -9 -f "sui-node" 2>/dev/null || true
     pkill -9 -f "sui-faucet" 2>/dev/null || true
     sleep 3
-    # Check if ports are still in use - warn but continue
     if ss -tlnp 2>/dev/null | grep -qE ":(9000|9123) "; then
-        log "  Warning: ports 9000/9123 may still be in use"
-        # Wait a bit more for ports to be released
-        sleep 5
+        sudo fuser -k 9000/tcp 9123/tcp 2>/dev/null || true
+        sleep 2
     fi
 }
 
@@ -238,7 +236,7 @@ else
 fi
 
 mountpoint -q "$MOUNT_POINT" || die "Mount failed!"
-sudo chmod -R 777 "$MOUNT_POINT" 2>/dev/null || true
+sudo chmod -R 777 "$MOUNT_POINT"
 log "✓ FDP storage ready"
 
 # ============================================================
@@ -405,7 +403,7 @@ log ""
 # Start sui with fullnode RPC and faucet (use sui start, not sui-node)
 # SUI_DISABLE_GAS=1 disables gas fees (requires custom SUI build)
 log "Starting sui process..."
-SUI_DISABLE_GAS=$SUI_DISABLE_GAS SUI_CONFIG_DIR=$LOCAL_DIR nohup sui start \
+SUI_DISABLE_GAS=$SUI_DISABLE_GAS SUI_CONFIG_DIR=$LOCAL_DIR sui start \
     --network.config "$LOCAL_DIR" \
     --fullnode-rpc-port 9000 \
     --with-faucet \

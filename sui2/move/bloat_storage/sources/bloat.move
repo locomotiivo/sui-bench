@@ -1,6 +1,6 @@
 module bloat_storage::bloat {
-    use sui::object::{Self, UID};
-    use sui::tx_context::{Self, TxContext};
+    use sui::object::UID;
+    use sui::tx_context::TxContext;
     use sui::transfer;
     use std::vector;
     use std::hash;

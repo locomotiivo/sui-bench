@@ -17,12 +17,12 @@ PACKAGE_ID="${PACKAGE_ID:-$(cat $SUI_CONFIG_DIR/.package_id 2>/dev/null || echo 
 NVME_DEVICE="${NVME_DEVICE:-nvme0n1}"
 
 # Conservative settings to avoid gas contention
-WORKERS="${WORKERS:-8}"
+WORKERS="${WORKERS:-16}"
 DURATION="${DURATION:-120}"
 
 # Batch size (can be overridden via env vars)
-BLOB_SIZE_KB="${BLOB_SIZE_KB:-200}"
-BATCH_COUNT="${BATCH_COUNT:-50}"
+BLOB_SIZE_KB="${BLOB_SIZE_KB:-150}"
+BATCH_COUNT="${BATCH_COUNT:-40}"
 BYTES_PER_TX=$((BLOB_SIZE_KB * BATCH_COUNT * 1024))
 
 export SUI_CONFIG_DIR
@@ -80,35 +80,16 @@ log ""
 RESULT_FILE=$(mktemp)
 trap "rm -f $RESULT_FILE" EXIT
 
-# Get available gas coins (sorted by balance descending, pick the largest ones)
-log "Getting available gas coins..."
-GAS_COINS=($(sui client gas --json 2>/dev/null | grep -o '"gasCoinId": "[^"]*"' | awk -F'"' '{print $4}' | head -n $WORKERS))
-
-if [ ${#GAS_COINS[@]} -lt $WORKERS ]; then
-    log "WARNING: Only ${#GAS_COINS[@]} gas coins available, but need $WORKERS. Some workers will share coins."
-    # Pad array by cycling through existing coins
-    while [ ${#GAS_COINS[@]} -lt $WORKERS ]; do
-        GAS_COINS+=("${GAS_COINS[$((${#GAS_COINS[@]} % ${#GAS_COINS[@]}))]}")
-    done
-fi
-
-log "Assigned gas coins to workers:"
-for i in $(seq 0 $((WORKERS - 1))); do
-    log "  Worker $((i+1)): ${GAS_COINS[$i]}"
-done
-
-# Worker function - each worker uses a specific gas coin to avoid contention
+# Worker function - uses timeout and fire-and-forget
 worker() {
     local id=$1
-    local gas_coin=$2
     while [ $(date +%s) -lt $end_time ]; do
-        # Fire transaction with 60s timeout, using specific gas coin
+        # Fire transaction with 60s timeout (increased for large batches)
         if timeout 60 sui client call \
             --package "$PACKAGE_ID" \
             --module bloat \
             --function create_blobs_batch \
             --args "$BLOB_SIZE_KB" "$BATCH_COUNT" \
-            --gas "$gas_coin" \
             --gas-budget 5000000000 \
             --json 2>/dev/null | grep -q '"status"'; then
             echo "S" >> "$RESULT_FILE"
@@ -121,11 +102,10 @@ worker() {
 log "Starting $WORKERS workers..."
 log ""
 
-# Start workers with specific gas coins
+# Start workers with slight stagger to reduce initial contention
 PIDS=""
 for i in $(seq 1 $WORKERS); do
-    idx=$((i - 1))
-    worker $i "${GAS_COINS[$idx]}" &
+    worker $i &
     PIDS="$PIDS $!"
     sleep 0.2  # Stagger starts
 done
@@ -250,7 +230,4 @@ elif [ $rate_mb_min -ge 2048 ]; then
 else
     log "  Status:           ✗ Need more throughput"
 fi
-log ""
-log "  NOTE: For GC stats, check FEMU host console or run:"
-log "        sudo /home/femu/fdp-scripts/fdp_send_sungjin /dev/nvme0n1"
 log ""
