@@ -24,7 +24,7 @@ MOUNT_POINT="${MOUNT_POINT:-$HOME/f2fs_fdp_mount}"
 # Auto-detect project root from script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/log}"
+RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/log}"
 
 # Export for child scripts
 export SUI_DISABLE_GAS

@@ -231,25 +231,14 @@ log "------------------------------------------------------------"
 kill_all_sui
 mkdir -p "$RESULTS_DIR"
 
-# Check if already mounted - skip 01-setup.sh if so (avoids sudo for mkfs)
-SKIP_RESET="${SKIP_RESET:-0}"
-if mountpoint -q "$MOUNT_POINT" && [ "$SKIP_RESET" -eq 0 ]; then
-    log "  Mount point already exists - skipping reformat"
-    log "  (Set SKIP_RESET=0 and run with sudo to reformat)"
-    SKIP_RESET=1
-fi
-
-if [ "$SKIP_RESET" -eq 0 ]; then
-    if [ -f "$SCRIPT_DIR/01-setup.sh" ]; then
-        FDP_MODE=$FDP_MODE RESET="yes" "$SCRIPT_DIR/01-setup.sh" 2>&1 | tee "$RESULTS_DIR/00_setup.log" >/dev/null
-    else
-        die "01-setup.sh not found!"
-    fi
+if [ -f "$SCRIPT_DIR/01-setup.sh" ]; then
+    FDP_MODE=$FDP_MODE RESET="yes" "$SCRIPT_DIR/01-setup.sh" 2>&1 | tee "$RESULTS_DIR/00_setup.log" >/dev/null
+else
+    die "01-setup.sh not found!"
 fi
 
 mountpoint -q "$MOUNT_POINT" || die "Mount failed!"
-# Try chmod without sudo - should work if user owns the mount
-chmod -R 777 "$MOUNT_POINT" 2>/dev/null || true
+sudo chmod -R 777 "$MOUNT_POINT" 2>/dev/null || true
 log "✓ FDP storage ready"
 
 # ============================================================

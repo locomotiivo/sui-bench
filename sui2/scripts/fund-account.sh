@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPTS_DIR="$HOME/fdp-scripts/sui-bench/scripts"
+SCRIPTS_DIR="$HOME/fdp-scripts/sui-bench/sui2/scripts"
 # Use the same config dir as the benchmark
 SUI_CONFIG_DIR="${SUI_CONFIG_DIR:-$HOME/f2fs_fdp_mount/p0/sui_node}"
 
