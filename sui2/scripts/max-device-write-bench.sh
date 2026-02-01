@@ -276,7 +276,7 @@ log "  F2FS_GC_FOREGROUND=$gc_fg"
 log ""
 
 # Save to CSV file for easy comparison
-RESULTS_DIR="$SCRIPT_DIR/results"
+RESULTS_DIR="/home/femu/fdp-scripts/sui-bench/sui2/fdp_lsm_results"
 mkdir -p "$RESULTS_DIR"
 RESULTS_CSV="$RESULTS_DIR/benchmark_results.csv"
 

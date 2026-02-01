@@ -113,6 +113,15 @@ mount_f2fs() {
     sudo "$FDP_TOOLS_DIR/fdp_f2fs_mount" "$nlogs"
     sudo chmod -R 777 "$MOUNT_POINT"
     
+    # Clean up any leftover FDP database directories to prevent corruption
+    log_info "Cleaning FDP directories for fresh start..."
+    for i in {0..7}; do
+        rm -rf "$MOUNT_POINT/p$i/authorities_db" 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p$i/consensus_db" 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p$i/epoch_db" 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p$i/full_node_db" 2>/dev/null || true
+    done
+    
     log_success "F2FS mounted at $MOUNT_POINT"
 }
 
