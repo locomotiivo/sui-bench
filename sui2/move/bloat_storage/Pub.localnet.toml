@@ -3,13 +3,13 @@
 # this file should not be committed to source control
 
 build-env = "localnet"
-chain-id = "1555f64f"
+chain-id = "56334a98"
 
 [[published]]
 source = { local = "/home/femu/fdp-scripts/sui-bench/sui2/move/bloat_storage" }
-published-at = "0x6f7eeb9eec0cdd5850d9e25f72d72985c202b1d8e1a077694c767a54dabe3a0d"
-original-id = "0x6f7eeb9eec0cdd5850d9e25f72d72985c202b1d8e1a077694c767a54dabe3a0d"
+published-at = "0x9128d9c6338ef357740a14048c7b239d7e8448218b1dff88e6803bc942b531cc"
+original-id = "0x9128d9c6338ef357740a14048c7b239d7e8448218b1dff88e6803bc942b531cc"
 version = 1
 toolchain-version = "1.66.0"
 build-config = { flavor = "sui", edition = "2024" }
-upgrade-capability = "0x59a05bb04369819b29584144d56a62496df0b079f462a67fdb15522fe415248c"
+upgrade-capability = "0xc46eb8cb61257bf965ae42c8be613d15cb5b5727f5b88bb9e541c9c53ea3b466"

@@ -44,20 +44,26 @@ module bloat_storage::bloat {
     }
 
     /// Create blob with INCOMPRESSIBLE random data (for storage bloat testing)
-    /// Uses tx digest hash + epoch + counter as seed for pseudo-random generation
+    /// Uses tx digest hash + epoch + counter + UID as seed for truly unique random generation
     public entry fun create_blob(size_kb: u64, ctx: &mut tx_context::TxContext) {
         let bytes = size_kb * 1024;
         
-        // Create unique seed from transaction context
-        // Combines epoch, sender address bytes, and a fresh UID for uniqueness
+        // Create UID first - this is unique per object
+        let uid = object::new(ctx);
+        
+        // Create unique seed from transaction context + UID bytes
         let epoch = tx_context::epoch(ctx);
         let sender = tx_context::sender(ctx);
         let sender_bytes = std::bcs::to_bytes(&sender);
         
-        // Hash the sender + epoch to get initial seed
+        // Get UID bytes for additional entropy
+        let uid_bytes = object::uid_to_bytes(&uid);
+        
+        // Hash sender + epoch + timestamp + UID for truly unique seed
         let mut seed_data = sender_bytes;
         vector::append(&mut seed_data, std::bcs::to_bytes(&epoch));
         vector::append(&mut seed_data, std::bcs::to_bytes(&tx_context::epoch_timestamp_ms(ctx)));
+        vector::append(&mut seed_data, uid_bytes);  // UID makes each blob unique
         let hash_bytes = hash::sha2_256(seed_data);
         
         // Convert first 8 bytes of hash to u64 seed
@@ -72,7 +78,7 @@ module bloat_storage::bloat {
         let data = generate_random_data(bytes, seed);
 
         let blob = Blob {
-            id: object::new(ctx),
+            id: uid,
             data,
             metadata: vector::empty(),
             counter: 1,
@@ -107,6 +113,7 @@ module bloat_storage::bloat {
     }
 
     /// Create multiple blobs in one PTB (uses incompressible random data)
+    /// Each blob gets a unique seed based on its index in the batch
     public entry fun create_blobs_batch(
         size_kb: u64, 
         count: u64, 
@@ -114,9 +121,55 @@ module bloat_storage::bloat {
     ) {
         let mut i = 0;
         while (i < count) {
-            create_blob(size_kb, ctx);
+            create_blob_with_index(size_kb, i, ctx);
             i = i + 1;
         };
+    }
+    
+    /// Create blob with unique index to ensure different random data per blob
+    fun create_blob_with_index(size_kb: u64, index: u64, ctx: &mut tx_context::TxContext) {
+        let bytes = size_kb * 1024;
+        
+        // Create UID first - this is unique per object
+        let uid = object::new(ctx);
+        
+        // Create unique seed from transaction context + index + UID
+        let epoch = tx_context::epoch(ctx);
+        let sender = tx_context::sender(ctx);
+        let sender_bytes = std::bcs::to_bytes(&sender);
+        
+        // Get UID bytes for additional entropy
+        let uid_bytes = object::uid_to_bytes(&uid);
+        
+        // Hash sender + epoch + timestamp + index + UID for truly unique seed
+        let mut seed_data = sender_bytes;
+        vector::append(&mut seed_data, std::bcs::to_bytes(&epoch));
+        vector::append(&mut seed_data, std::bcs::to_bytes(&tx_context::epoch_timestamp_ms(ctx)));
+        vector::append(&mut seed_data, std::bcs::to_bytes(&index));
+        vector::append(&mut seed_data, uid_bytes);  // UID makes each blob truly unique
+        let hash_bytes = hash::sha2_256(seed_data);
+        
+        // Convert first 8 bytes of hash to u64 seed
+        let mut seed: u64 = 0;
+        let mut j = 0;
+        while (j < 8) {
+            seed = (seed << 8) | (*vector::borrow(&hash_bytes, j) as u64);
+            j = j + 1;
+        };
+        
+        // Generate incompressible random data
+        let data = generate_random_data(bytes, seed);
+
+        let blob = Blob {
+            id: uid,
+            data,
+            metadata: vector::empty(),
+            counter: 1,
+            timestamp: epoch,
+            owner: sender,
+        };
+
+        transfer::transfer(blob, tx_context::sender(ctx));
     }
 
     /// Update blob with INCOMPRESSIBLE random data (creates new version = storage churn)

@@ -231,3 +231,65 @@ else
     log "  Status:           ✗ Need more throughput"
 fi
 log ""
+# ═══════════════════════════════════════════════════════════════
+# RESEARCH OUTPUT - Machine-readable format for FDP comparison
+# ═══════════════════════════════════════════════════════════════
+
+# Determine FDP mode from mount options
+FDP_MODE="nofdp"
+if mount | grep -q "f2fs.*fdp_log_n"; then
+    FDP_MODE="fdp"
+fi
+
+# Get total device writes (all time)
+total_device_sectors=$(awk -v dev="$NVME_DEVICE" '$3 == dev {print $10}' /proc/diskstats)
+total_device_all_time=$((total_device_sectors * 512))
+total_device_all_time_gb=$(echo "scale=2; $total_device_all_time / 1073741824" | bc 2>/dev/null || echo "0")
+
+# Get F2FS GC stats
+gc_bg=$(cat /sys/fs/f2fs/$NVME_DEVICE/gc_background_calls 2>/dev/null || echo "0")
+gc_fg=$(cat /sys/fs/f2fs/$NVME_DEVICE/gc_foreground_calls 2>/dev/null || echo "0")
+
+# Calculate device capacity overwrite ratio
+device_capacity_gb=64
+overwrite_ratio=$(echo "scale=2; $total_device_all_time_gb / $device_capacity_gb" | bc 2>/dev/null || echo "0")
+
+log "═══════════════════════════════════════════════════════════════"
+log "  RESEARCH METRICS (for FDP comparison)"
+log "═══════════════════════════════════════════════════════════════"
+log ""
+log "  # Copy these for your research data:"
+log "  MODE=$FDP_MODE"
+log "  DURATION_SEC=$total_elapsed"
+log "  WORKERS=$WORKERS"
+log "  TPS=$tps"
+log "  SUCCESS_TX=$success"
+log "  FAILED_TX=$fail"
+log "  APP_WRITES_BYTES=$total_app_bytes"
+log "  DEVICE_WRITES_BYTES=$total_device_bytes"
+log "  WAF=$final_wa"
+log "  DEVICE_RATE_MB_MIN=$rate_mb_min"
+log "  TOTAL_DEVICE_WRITES_GB=$total_device_all_time_gb"
+log "  OVERWRITE_RATIO=$overwrite_ratio"
+log "  F2FS_GC_BACKGROUND=$gc_bg"
+log "  F2FS_GC_FOREGROUND=$gc_fg"
+log ""
+
+# Save to CSV file for easy comparison
+RESULTS_DIR="$SCRIPT_DIR/results"
+mkdir -p "$RESULTS_DIR"
+RESULTS_CSV="$RESULTS_DIR/benchmark_results.csv"
+
+# Create header if file doesn't exist
+if [ ! -f "$RESULTS_CSV" ]; then
+    echo "timestamp,mode,duration_sec,workers,tps,success_tx,failed_tx,app_writes_bytes,device_writes_bytes,waf,rate_mb_min,total_device_gb,overwrite_ratio,gc_bg,gc_fg" > "$RESULTS_CSV"
+fi
+
+# Append results
+echo "$(date -Iseconds),$FDP_MODE,$total_elapsed,$WORKERS,$tps,$success,$fail,$total_app_bytes,$total_device_bytes,$final_wa,$rate_mb_min,$total_device_all_time_gb,$overwrite_ratio,$gc_bg,$gc_fg" >> "$RESULTS_CSV"
+
+log "  Results appended to: $RESULTS_CSV"
+log ""
+
+# Cleanup
+rm -f "$RESULT_FILE"
