@@ -386,7 +386,9 @@ main() {
     
     if [ "$NONFDP" != "yes" ]; then
         nfdp_waf=$(run_fdp_disabled_benchmark)
-        sleep 30
+        if [ "$NOFDP" != "yes" ]; then
+            sleep 30
+        fi
     fi
     
     if [ "$NOFDP" != "yes" ]; then
@@ -396,8 +398,12 @@ main() {
     set -e
     
     log_section "FINAL RESULTS"
-    echo "Non-FDP WAF: $nfdp_waf" | tee "$RESULTS_DIR/final_comparison.txt"
-    echo "FDP WAF:     $fdp_waf" | tee -a "$RESULTS_DIR/final_comparison.txt"
+    if [ "$NONFDP" != "yes" ]; then
+        echo "Non-FDP WAF: $nfdp_waf" | tee "$RESULTS_DIR/final_comparison.txt"
+    fi
+    if [ "$NOFDP" != "yes" ]; then
+        echo "FDP WAF:     $fdp_waf" | tee -a "$RESULTS_DIR/final_comparison.txt"
+    fi
     
     if [[ "$nfdp_waf" != "N/A" && "$fdp_waf" != "N/A" ]]; then
         local improvement=$(echo "scale=2; (($nfdp_waf - $fdp_waf) / $nfdp_waf) * 100" | bc 2>/dev/null || echo "N/A")
