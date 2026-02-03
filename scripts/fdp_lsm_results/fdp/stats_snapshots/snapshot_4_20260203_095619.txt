@@ -1,0 +1,15 @@
+Snapshot #4
+Timestamp: 2026-02-03T09:56:19+00:00
+Elapsed: 3604s (60.0min)
+
+Host Statistics (diskstats):
+  Sectors written: 415145664
+  MB written: 202707.84
+
+FEMU GC Statistics (cumulative):
+  sum(wpp->written): 0 pages
+  copied (GC): 0 pages
+  WAF: N/A
+
+WAF = 1 + (copied / sum_written)
+    = 1 + (0 / 0)

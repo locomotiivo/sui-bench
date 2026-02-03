@@ -1,0 +1,31 @@
+═══════════════════════════════════════════════════════════════
+  Benchmark Summary: fdp
+═══════════════════════════════════════════════════════════════
+
+Configuration:
+  Workers: 256
+  Duration: 7207s (target: 7200s)
+  Stats interval: 900s
+  Snapshots collected: 7
+
+Performance:
+  TPS: TPS: tx/sec
+
+Write Amplification:
+  sum(wpp->written): 0 pages
+  GC copied: 0 pages
+  Final WAF: N/A
+
+  WAF = 1 + (copied / sum_written)
+      = 1 + (0 / 0)
+
+Host Writes (diskstats):
+  Start sectors: 311515080
+  Final sectors: 617010448
+  Delta: 305495368 sectors (145.67 GB)
+
+Output Files:
+  WAF timeseries: /home/femu/fdp-scripts/sui-bench/sui2/scripts/fdp_lsm_results/fdp/waf_timeseries.csv
+  Snapshots: /home/femu/fdp-scripts/sui-bench/sui2/scripts/fdp_lsm_results/fdp/stats_snapshots/
+  Benchmark log: /home/femu/fdp-scripts/sui-bench/sui2/scripts/fdp_lsm_results/fdp/benchmark.log
+═══════════════════════════════════════════════════════════════

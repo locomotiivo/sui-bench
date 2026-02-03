@@ -1,5 +1,0 @@
-node_modules
-.nitro
-.output
-move/*/build
-logs
