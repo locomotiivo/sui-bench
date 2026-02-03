@@ -26,6 +26,13 @@ DURATION="${DURATION:-7200}"
 BLOB_SIZE_KB="${BLOB_SIZE_KB:-200}"
 BATCH_COUNT="${BATCH_COUNT:-5}"
 
+# Benchmark strategy: 'blobs' (create only) or 'update_heavy' (update churn)
+BENCH_STRATEGY="${BENCH_STRATEGY:-blobs}"
+
+# Update-heavy specific parameters (only used if BENCH_STRATEGY=update_heavy)
+UPDATE_POOL_SIZE="${UPDATE_POOL_SIZE:-100}"
+UPDATE_RATIO="${UPDATE_RATIO:-80}"
+
 # Periodic stats collection interval (seconds) - default 15 minutes
 # Now uses fdp_stats --read-only which doesn't reset counters
 STATS_INTERVAL="${STATS_INTERVAL:-900}"
@@ -482,11 +489,14 @@ run_benchmark() {
     export SUI_CONFIG_DIR="$config_dir"
     export PACKAGE_ID="$pkg_id"
     export WORKERS DURATION BLOB_SIZE_KB BATCH_COUNT
+    export UPDATE_POOL_SIZE UPDATE_RATIO
+    export RESULTS_DIR="$run_dir"
     
     # Record starting diskstats
     local start_sectors=$(get_diskstats_writes)
     {
         echo "benchmark_mode=$mode"
+        echo "benchmark_strategy=$BENCH_STRATEGY"
         echo "start_time=$(date -Iseconds)"
         echo "start_sectors_written=$start_sectors"
         echo "stats_interval=${STATS_INTERVAL}s"
@@ -497,7 +507,15 @@ run_benchmark() {
     
     local bench_output="$run_dir/benchmark.log"
     cd "$SCRIPT_DIR"
-    ./max-device-write-bench.sh 2>&1 | tee "$bench_output"
+    
+    # Run selected benchmark strategy
+    if [ "$BENCH_STRATEGY" = "update_heavy" ]; then
+        log_info "Running update-heavy benchmark (maximize LSM churn)..."
+        ./update-heavy-bench.sh 2>&1 | tee "$bench_output"
+    else
+        log_info "Running create-only benchmark..."
+        ./max-device-write-bench.sh 2>&1 | tee "$bench_output"
+    fi
     
     local end_time=$(date +%s)
     

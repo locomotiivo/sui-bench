@@ -194,6 +194,115 @@ export async function runMixedStrategy(
 }
 
 /**
+ * Update-Heavy Strategy - Maximize LSM-tree version churn
+ * 
+ * This strategy creates maximum storage layer activity by repeatedly updating
+ * the same objects. Each update creates a new version in RocksDB, which:
+ * 1. Writes new data to L0 (memtable flush)
+ * 2. Triggers compaction as versions accumulate
+ * 3. Forces merge of old versions (write amplification)
+ * 4. Eventually triggers garbage collection of old versions
+ * 
+ * Phase 1 (Warmup): Create a pool of blobs
+ * Phase 2 (Churn): Heavily update existing blobs (80% updates, 20% creates)
+ */
+export async function runUpdateHeavyStrategy(
+  ctx: SuiContext,
+  packageId: string,
+  config: BenchmarkConfig,
+  stats: BenchmarkStats,
+  ownedBlobs: string[],
+  iteration: number
+): Promise<void> {
+  const isWarmup = ownedBlobs.length < config.updatePoolSize;
+  const shouldUpdate = !isWarmup && Math.random() < config.updateRatio;
+  
+  const tx = new Transaction();
+  
+  if (shouldUpdate && ownedBlobs.length > 0) {
+    // UPDATE PHASE: Update multiple existing blobs
+    // Pick random blobs to update (up to batchSize)
+    const updateCount = Math.min(config.batchSize, ownedBlobs.length);
+    const indicesToUpdate = new Set<number>();
+    
+    while (indicesToUpdate.size < updateCount) {
+      indicesToUpdate.add(Math.floor(Math.random() * ownedBlobs.length));
+    }
+    
+    for (const idx of indicesToUpdate) {
+      const blobId = ownedBlobs[idx];
+      // Vary the new size to create different write patterns
+      const newSizeKb = config.blobSizeKb + (iteration % 5) * 20;  // 100-180KB
+      
+      tx.moveCall({
+        target: `${packageId}::bloat::update_blob`,
+        arguments: [
+          tx.object(blobId),
+          tx.pure.u64(newSizeKb),
+        ],
+      });
+    }
+    
+    // Estimate gas: updates are more expensive due to reading old data
+    const estimatedGas = config.blobSizeKb * updateCount * 15000 + 20_000_000;
+    tx.setGasBudget(estimatedGas);
+    
+    stats.totalTx++;
+    
+    try {
+      await executeTransaction(ctx, tx);
+      stats.successTx++;
+      // Updates rewrite the entire blob
+      stats.totalBytesWritten += config.blobSizeKb * updateCount * 1024;
+      stats.lastTxTime = Date.now();
+    } catch (e) {
+      stats.failedTx++;
+      throw e;
+    }
+  } else {
+    // CREATE PHASE: Create new blobs (warmup or occasional creates)
+    tx.moveCall({
+      target: `${packageId}::bloat::create_blobs_batch`,
+      arguments: [
+        tx.pure.u64(config.blobSizeKb),
+        tx.pure.u64(config.batchSize),
+      ],
+    });
+    
+    const estimatedGas = config.blobSizeKb * config.batchSize * 10000 + 10_000_000;
+    tx.setGasBudget(estimatedGas);
+    
+    stats.totalTx++;
+    
+    try {
+      const result = await executeTransaction(ctx, tx, true);
+      stats.successTx++;
+      stats.totalBytesWritten += config.blobSizeKb * config.batchSize * 1024;
+      stats.lastTxTime = Date.now();
+      
+      // Track new blobs (add to pool, but cap at 2x pool size to allow rotation)
+      const newBlobs = result.objectChanges
+        ?.filter(c => c.type === 'created' && 'objectType' in c && c.objectType?.includes('Blob'))
+        .map(c => (c as any).objectId) || [];
+      
+      ownedBlobs.push(...newBlobs);
+      
+      // Trim pool to 2x size (keep some rotation)
+      if (ownedBlobs.length > config.updatePoolSize * 2) {
+        ownedBlobs.splice(0, ownedBlobs.length - config.updatePoolSize * 2);
+      }
+      
+      if (isWarmup && ownedBlobs.length >= config.updatePoolSize) {
+        console.log(`[update_heavy] Warmup complete: ${ownedBlobs.length} blobs in pool`);
+      }
+    } catch (e) {
+      stats.failedTx++;
+      throw e;
+    }
+  }
+}
+
+/**
  * Format bytes to human readable
  */
 export function formatBytes(bytes: number): string {

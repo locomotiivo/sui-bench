@@ -24,6 +24,7 @@ import {
   runVariedStrategy,
   runChurnStrategy,
   runMixedStrategy,
+  runUpdateHeavyStrategy,
   printStats,
   BenchmarkStats,
 } from './strategies.js';
@@ -78,6 +79,10 @@ async function main() {
   console.log(`  Batch Size:    ${config.batchSize}`);
   console.log(`  Concurrency:   ${config.concurrency}`);
   console.log(`  Strategy:      ${config.strategy}`);
+  if (config.strategy === 'update_heavy') {
+    console.log(`  Update Pool:   ${config.updatePoolSize} blobs`);
+    console.log(`  Update Ratio:  ${(config.updateRatio * 100).toFixed(0)}% updates`);
+  }
   console.log(`  Duration:      ${config.durationMinutes || 'infinite'} min`);
   console.log('');
   
@@ -145,6 +150,9 @@ async function main() {
             break;
           case 'churn':
             await runChurnStrategy(ctx, packageId, config, stats, ownedBlobs);
+            break;
+          case 'update_heavy':
+            await runUpdateHeavyStrategy(ctx, packageId, config, stats, ownedBlobs, iteration);
             break;
           case 'mixed':
           default:
