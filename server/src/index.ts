@@ -25,6 +25,7 @@ import {
   runChurnStrategy,
   runMixedStrategy,
   runUpdateHeavyStrategy,
+  runMixedLifetimeStrategy,
   printStats,
   BenchmarkStats,
 } from './strategies.js';
@@ -82,6 +83,19 @@ async function main() {
   if (config.strategy === 'update_heavy') {
     console.log(`  Update Pool:   ${config.updatePoolSize} blobs`);
     console.log(`  Update Ratio:  ${(config.updateRatio * 100).toFixed(0)}% updates`);
+  }
+  if (config.strategy === 'mixed_lifetime') {
+    console.log(`  ─── Hot Data (Account State) ───`);
+    console.log(`    Size:        ${config.hotSizeKb} KB`);
+    console.log(`    Batch:       ${config.hotBatchSize}`);
+    console.log(`    Pool Size:   ${config.hotPoolSize}`);
+    console.log(`    Updates/obj: ${config.hotUpdateRounds}`);
+    console.log(`  ─── Cold Data (Ledger) ───`);
+    console.log(`    Size:        ${config.coldSizeKb} KB`);
+    console.log(`    Batch:       ${config.coldBatchSize}`);
+    console.log(`  ─── Mix Ratio ───`);
+    console.log(`    Hot ops:     ${(config.hotRatio * 100).toFixed(0)}%`);
+    console.log(`    Cold ops:    ${((1 - config.hotRatio) * 100).toFixed(0)}%`);
   }
   console.log(`  Duration:      ${config.durationMinutes || 'infinite'} min`);
   console.log('');
@@ -153,6 +167,9 @@ async function main() {
             break;
           case 'update_heavy':
             await runUpdateHeavyStrategy(ctx, packageId, config, stats, ownedBlobs, iteration);
+            break;
+          case 'mixed_lifetime':
+            await runMixedLifetimeStrategy(ctx, packageId, config, stats, ownedBlobs as any, iteration);
             break;
           case 'mixed':
           default:

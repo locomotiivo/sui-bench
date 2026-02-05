@@ -1,0 +1,2 @@
+# sudo bash -c 'nohup /home/femu/fdp-scripts/sui-bench/scripts/high-churn-benchmark.sh > /home/femu/fdp-scripts/sui-bench/scripts/high-churn-benchmark.log 2>&1 &'
+sudo bash -c 'env WORKLOAD_MODE=mixed MIXED_CREATE_PCT=30 MIXED_UPDATE_PCT=70 BLOB_MODE=yes BLOBS_PER_WORKER=1500 PARALLEL_PTBS=20 nohup ./high-churn-benchmark.sh > /home/femu/fdp-scripts/sui-bench/scripts/high-churn-benchmark.log 2>&1 &'

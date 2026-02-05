@@ -303,6 +303,208 @@ export async function runUpdateHeavyStrategy(
 }
 
 /**
+ * Mixed-Lifetime Strategy - Hot/Cold workload for FDP evaluation
+ * 
+ * This strategy creates a realistic workload with two distinct data patterns
+ * to highlight FDP (Flexible Data Placement) capabilities:
+ * 
+ * HOT DATA (Account State Pattern):
+ *   - Small objects (~10KB)
+ *   - Frequently updated (high churn)
+ *   - Short lifetime before invalidation
+ *   - Represents: balances, counters, game state, DeFi positions
+ * 
+ * COLD DATA (Ledger Pattern):
+ *   - Large objects (~200KB)
+ *   - Write-once, never modified
+ *   - Long lifetime (permanent)
+ *   - Represents: transaction history, audit logs, certificates
+ * 
+ * WHY THIS MATTERS FOR FDP:
+ * - Without FDP: Hot and cold pages interleave in same erase blocks
+ *   When GC runs, it must copy valid cold pages even though hot pages are invalid
+ *   → HIGH Write Amplification Factor (WAF)
+ * 
+ * - With FDP: Hot data goes to PID 0 (account state), Cold to PID 1 (ledger)
+ *   GC on hot blocks finds mostly invalid pages → copy little
+ *   Cold blocks rarely need GC (append-only data)
+ *   → LOW WAF
+ */
+
+// Track hot objects with their update counts
+interface HotObject {
+  objectId: string;
+  updateCount: number;
+}
+
+export async function runMixedLifetimeStrategy(
+  ctx: SuiContext,
+  packageId: string,
+  config: BenchmarkConfig,
+  stats: BenchmarkStats,
+  hotObjects: HotObject[],
+  iteration: number
+): Promise<{ hotBytes: number; coldBytes: number }> {
+  // Decide: hot or cold operation based on ratio
+  const isHotOp = Math.random() < config.hotRatio;
+  const result = { hotBytes: 0, coldBytes: 0 };
+  
+  const tx = new Transaction();
+  
+  if (isHotOp) {
+    // ═══════════════════════════════════════════════════════════════
+    // HOT OPERATION: Update existing or create new hot objects
+    // ═══════════════════════════════════════════════════════════════
+    const isWarmup = hotObjects.length < config.hotPoolSize;
+    
+    if (!isWarmup) {
+      // Find object to update (hasn't reached max update rounds)
+      const objToUpdate = hotObjects.find(o => o.updateCount < config.hotUpdateRounds);
+      
+      if (objToUpdate) {
+        // UPDATE: Modify existing hot object (simulates account state change)
+        const newSizeKb = config.hotSizeKb + (iteration % 5);  // Slight size variation
+        
+        tx.moveCall({
+          target: `${packageId}::bloat::update_blob`,
+          arguments: [
+            tx.object(objToUpdate.objectId),
+            tx.pure.u64(newSizeKb),
+          ],
+        });
+        
+        const estimatedGas = newSizeKb * 15000 + 10_000_000;
+        tx.setGasBudget(estimatedGas);
+        
+        stats.totalTx++;
+        
+        try {
+          await executeTransaction(ctx, tx);
+          stats.successTx++;
+          objToUpdate.updateCount++;
+          result.hotBytes = newSizeKb * 1024;
+          stats.totalBytesWritten += result.hotBytes;
+          stats.lastTxTime = Date.now();
+        } catch (e) {
+          stats.failedTx++;
+          throw e;
+        }
+      } else {
+        // All objects fully updated - delete oldest and create new batch
+        // This simulates account state being replaced/archived
+        
+        // Delete the oldest hot objects
+        const toDelete = hotObjects.splice(0, Math.min(config.hotBatchSize, hotObjects.length));
+        for (const obj of toDelete) {
+          tx.moveCall({
+            target: `${packageId}::bloat::delete_blob`,
+            arguments: [tx.object(obj.objectId)],
+          });
+        }
+        
+        // Create new hot objects
+        tx.moveCall({
+          target: `${packageId}::bloat::create_blobs_batch`,
+          arguments: [
+            tx.pure.u64(config.hotSizeKb),
+            tx.pure.u64(config.hotBatchSize),
+          ],
+        });
+        
+        const estimatedGas = config.hotSizeKb * config.hotBatchSize * 12000 + 20_000_000;
+        tx.setGasBudget(estimatedGas);
+        
+        stats.totalTx++;
+        
+        try {
+          const txResult = await executeTransaction(ctx, tx, true);
+          stats.successTx++;
+          result.hotBytes = config.hotSizeKb * config.hotBatchSize * 1024;
+          stats.totalBytesWritten += result.hotBytes;
+          stats.lastTxTime = Date.now();
+          
+          // Track new hot objects
+          const newBlobs = txResult.objectChanges
+            ?.filter(c => c.type === 'created' && 'objectType' in c && c.objectType?.includes('Blob'))
+            .map(c => ({ objectId: (c as any).objectId, updateCount: 0 })) || [];
+          
+          hotObjects.push(...newBlobs);
+        } catch (e) {
+          stats.failedTx++;
+          throw e;
+        }
+      }
+    } else {
+      // WARMUP: Build hot object pool
+      tx.moveCall({
+        target: `${packageId}::bloat::create_blobs_batch`,
+        arguments: [
+          tx.pure.u64(config.hotSizeKb),
+          tx.pure.u64(config.hotBatchSize),
+        ],
+      });
+      
+      const estimatedGas = config.hotSizeKb * config.hotBatchSize * 10000 + 10_000_000;
+      tx.setGasBudget(estimatedGas);
+      
+      stats.totalTx++;
+      
+      try {
+        const txResult = await executeTransaction(ctx, tx, true);
+        stats.successTx++;
+        result.hotBytes = config.hotSizeKb * config.hotBatchSize * 1024;
+        stats.totalBytesWritten += result.hotBytes;
+        stats.lastTxTime = Date.now();
+        
+        const newBlobs = txResult.objectChanges
+          ?.filter(c => c.type === 'created' && 'objectType' in c && c.objectType?.includes('Blob'))
+          .map(c => ({ objectId: (c as any).objectId, updateCount: 0 })) || [];
+        
+        hotObjects.push(...newBlobs);
+        
+        if (hotObjects.length >= config.hotPoolSize) {
+          console.log(`[mixed_lifetime] Hot pool warmup complete: ${hotObjects.length} objects`);
+        }
+      } catch (e) {
+        stats.failedTx++;
+        throw e;
+      }
+    }
+  } else {
+    // ═══════════════════════════════════════════════════════════════
+    // COLD OPERATION: Create large write-once objects (ledger data)
+    // These are NEVER updated or deleted - simulating immutable logs
+    // ═══════════════════════════════════════════════════════════════
+    tx.moveCall({
+      target: `${packageId}::bloat::create_blobs_batch`,
+      arguments: [
+        tx.pure.u64(config.coldSizeKb),
+        tx.pure.u64(config.coldBatchSize),
+      ],
+    });
+    
+    const estimatedGas = config.coldSizeKb * config.coldBatchSize * 10000 + 10_000_000;
+    tx.setGasBudget(estimatedGas);
+    
+    stats.totalTx++;
+    
+    try {
+      await executeTransaction(ctx, tx);
+      stats.successTx++;
+      result.coldBytes = config.coldSizeKb * config.coldBatchSize * 1024;
+      stats.totalBytesWritten += result.coldBytes;
+      stats.lastTxTime = Date.now();
+      // Note: We don't track cold objects - they're write-once (ledger pattern)
+    } catch (e) {
+      stats.failedTx++;
+      throw e;
+    }
+  }
+  
+  return result;
+}
+
+/**
  * Format bytes to human readable
  */
 export function formatBytes(bytes: number): string {

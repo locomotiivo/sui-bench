@@ -70,9 +70,9 @@ export async function publishPackage(
   
   const tx = new Transaction();
   
-  // Publish
+  // Publish - convert Uint8Array to number[][] as required by SDK
   const [upgradeCap] = tx.publish({
-    modules: modules.map(m => Uint8Array.from(m)),
+    modules: modules.map(m => Array.from(Uint8Array.from(m))),
     dependencies: dependencyIds,
   });
   
