@@ -1,6 +1,16 @@
+# Logs and results
 *.log
-*.toml
-*.txt
-*.csv
-scripts/fdp-lsm-results/*
-move/bloat_storage/build/*
+results/
+scripts/results/
+
+# Move build artifacts
+move/*/build/
+*.lock
+
+# Editor and OS
+.DS_Store
+*.swp
+*~
+
+# Temporary files
+*.tmp

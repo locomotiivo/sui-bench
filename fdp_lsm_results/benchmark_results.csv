@@ -1,3 +1,0 @@
-timestamp,mode,duration_sec,workers,tps,success_tx,failed_tx,app_writes_bytes,device_writes_bytes,waf,rate_mb_min,total_device_gb,overwrite_ratio,gc_bg,gc_fg
-2026-02-03T08:55:27+00:00,nofdp,7204,256,39.02,281115,166585,287861760000,159026765824,.55,1263,148.23,2.31,0,0
-2026-02-03T10:56:22+00:00,nofdp,7206,256,37.52,270402,154912,276891648000,156288528384,.56,1241,294.10,4.59,0,0
