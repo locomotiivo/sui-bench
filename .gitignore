@@ -1,2 +1,6 @@
 *.log
 *.toml
+*.txt
+*.csv
+scripts/fdp-lsm-results/*
+move/bloat_storage/build/*
