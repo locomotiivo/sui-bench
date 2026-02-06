@@ -3,6 +3,10 @@
 results/
 scripts/results/
 
+# cargo build artifacts
+target/
+.package_id
+
 # Move build artifacts
 move/*/build/
 *.lock
