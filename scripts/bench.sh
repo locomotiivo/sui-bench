@@ -26,7 +26,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$SCRIPT_DIR/.."
 FDP_TOOLS_DIR="/home/femu/fdp-scripts/f2fs-tools-fdp"
-FDP_STATS="$FDP_TOOLS_DIR/fdp_stats"
+FDP_STATS="$SCRIPT_DIR/fdp_stats"
 MOUNT_POINT="/home/femu/f2fs_fdp_mount"
 NVME_DEVICE="nvme0n1"
 NVME_DEV_PATH="/dev/$NVME_DEVICE"
@@ -35,30 +35,93 @@ MOVE_DIR="$BENCH_DIR/move/io_churn"
 # Benchmark binary
 BENCH_BINARY="$BENCH_DIR/target/release/fdp-sui-bench"
 
+# sui-single-node-benchmark for rapid disk prefill
+SUI_SINGLE_NODE_BENCH="/home/femu/sui/target/release/sui-single-node-benchmark"
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# BENCHMARK PARAMETERS
+# BENCHMARK PARAMETERS - NFT MINTING APPROACH
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Duration and throughput - TUNED FOR HIGH I/O
-DURATION="${DURATION:-5400}"                   # 90 minutes default
-WORKERS="${WORKERS:-32}"                      # More concurrent workers
-BATCH_SIZE="${BATCH_SIZE:-100}"               # More objects per transaction
-MAX_INFLIGHT="${MAX_INFLIGHT:-500}"           # More concurrent transactions
-TARGET_TPS="${TARGET_TPS:-0}"                 # 0 = unlimited
-
-# Workload mix - HEAVY UPDATES to cause more compaction/overwrites
-CREATE_PCT="${CREATE_PCT:-10}"                # 10% CREATE = 90% updates (more rewrites)
-SEED_OBJECTS="${SEED_OBJECTS:-500}"           # More seed objects to update
-
-# Use 4KB LargeBlob objects instead of MicroCounters (40x more I/O per object)
-USE_BLOBS="${USE_BLOBS:-no}"
-
-# Gas - high budget for large batches
-GAS_BUDGET="${GAS_BUDGET:-2000000000}"
+# NOTE: We use sui-single-node-benchmark with NFT minting instead of SDK benchmark
+# The below parameters are NOT used anymore - keeping for reference only
+# DURATION, WORKERS, BATCH_SIZE etc. are SDK benchmark parameters
 
 # Control flags
 NOFDP="${NOFDP:-no}"                          # Skip FDP benchmark
 NONFDP="${NONFDP:-no}"                        # Skip non-FDP benchmark
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NFT MINTING BENCHMARK PARAMETERS - TURBO MODE
+# 
+# Strategy: sui-single-node-benchmark has INTERNAL RocksDB + execution engine.
+# TIME-BASED mode: Fixed duration for each phase (guarantees all phases run)
+#   - 50K TX × 5 NFTs × 6KB = ~1.5GB raw data per batch (manageable)
+#   - Phase 3 counter updates for rapid invalidation burst
+# ═══════════════════════════════════════════════════════════════════════════════
+# UPDATE-HEAVY STRATEGY (realistic blockchain workload)
+#
+# Real blockchains: Create objects once, UPDATE them millions of times
+# NFT minting = CREATE (append-only, no compaction pressure)
+# Counter updates = UPDATE (version churn, massive compaction, WAF > 1)
+#
+# Phase 1: Short setup - create initial state + counters
+# Phase 2: Long update phase - hammer counters with updates (realistic steady-state)
+# Phase 3: Optional cleanup phase
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# TIME-BASED PHASE DURATIONS (in minutes)
+# GC expected within 15-30 minutes with UPDATE-heavy workload
+SETUP_DURATION_MIN="${SETUP_DURATION_MIN:-5}"     # 5 min setup (create initial objects)
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIFIED WORKLOAD PARAMETERS
+# Inspired by Solana's bench-tps: continuous workload with state updates
+# ═══════════════════════════════════════════════════════════════════════════════
+BENCH_DURATION_MIN="${BENCH_DURATION_MIN:-40}"    # 40 min total (like Solana's --duration)
+
+# WORKLOAD MODE: "balanced" or "solana-style"
+# - balanced: More NFT mints for faster disk fill + counter updates
+# - solana-style: Fewer mints, more counter updates (closer to Solana transfers)
+WORKLOAD_MODE="${WORKLOAD_MODE:-balanced}"
+
+# Per-batch parameters (keep small for memory safety!)
+TX_COUNT="${TX_COUNT:-5000}"                      # 5K TXs per batch (like Solana's --tx-count)
+
+if [ "$WORKLOAD_MODE" = "solana-style" ]; then
+    # SOLANA-STYLE: More like bench-tps - repeated state updates (transfers)
+    # Solana transfers 1 lamport back and forth - we update counters repeatedly
+    NUM_MINTS="${NUM_MINTS:-1}"                   # Minimal mints (just for some data)
+    NFT_SIZE="${NFT_SIZE:-1000}"                  # 1KB per NFT (smaller)
+    NUM_COUNTERS="${NUM_COUNTERS:-50}"            # 50 counter updates per TX (like 50 transfers)
+    # Per batch: 5000 × 1 × 1KB = 5MB new + 250K state updates (high churn)
+else
+    # BALANCED: Disk fill + compaction pressure
+    NUM_MINTS="${NUM_MINTS:-5}"                   # 5 NFTs per TX (disk fill)
+    NFT_SIZE="${NFT_SIZE:-4000}"                  # 4KB per NFT
+    NUM_COUNTERS="${NUM_COUNTERS:-20}"            # 20 counter updates per TX
+    # Per batch: 5000 × 5 × 4KB = 100MB new + 100K state updates
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPARISON TO SOLANA BENCH-TPS:
+# ═══════════════════════════════════════════════════════════════════════════════
+# Solana bench-tps:
+#   - Transfers 1 lamport between pre-funded keypairs
+#   - Alternates direction (A→B, then B→A) = same accounts updated repeatedly
+#   - Focuses on TPS, not disk fill
+#   - Transaction size: ~600 bytes
+#
+# SUI equivalent:
+#   - Counter updates = state changes (like transfers updating balances)
+#   - NFT mints = initial funding (but larger to stress disk I/O)
+#   - --num-shared-objects updates = like repeated transfers on same accounts
+#
+# Key difference: Solana's tiny txs maximize TPS; we use larger objects to
+# stress disk I/O since that's our WAF measurement goal.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# MEMORY LIMITS - more aggressive to prevent ballooning
+MAX_MEMORY_PCT="${MAX_MEMORY_PCT:-60}"            # Pause if memory exceeds 60%
+DB_PARALLELISM="${DB_PARALLELISM:-4}"             # Limit to 4 cores for memory safety
 
 # HOST access for FEMU stats
 HOST_IP="${HOST_IP:-10.0.2.2}"
@@ -119,6 +182,53 @@ format_bytes() {
     fi
 }
 
+# Memory monitoring for 16GB RAM safety
+check_memory() {
+    local mem_info=$(free -m | awk 'NR==2{print $2,$3,$4,$7}')
+    local total=$(echo "$mem_info" | cut -d' ' -f1)
+    local used=$(echo "$mem_info" | cut -d' ' -f2)
+    local free=$(echo "$mem_info" | cut -d' ' -f3)
+    local available=$(echo "$mem_info" | cut -d' ' -f4)
+    local pct=$((used * 100 / total))
+    
+    echo "$pct $used $total $available"
+}
+
+wait_for_memory() {
+    local max_pct="${MAX_MEMORY_PCT:-80}"
+    local mem_check=$(check_memory)
+    local pct=$(echo "$mem_check" | cut -d' ' -f1)
+    local used=$(echo "$mem_check" | cut -d' ' -f2)
+    local total=$(echo "$mem_check" | cut -d' ' -f3)
+    local available=$(echo "$mem_check" | cut -d' ' -f4)
+    
+    if [ "$pct" -ge "$max_pct" ]; then
+        log_warning "Memory at ${pct}% (${used}MB/${total}MB), waiting for GC..."
+        # Force sync and drop caches to free memory
+        sync
+        sudo sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
+        sleep 10
+        
+        # Check again
+        mem_check=$(check_memory)
+        pct=$(echo "$mem_check" | cut -d' ' -f1)
+        if [ "$pct" -ge 90 ]; then
+            log_error "CRITICAL: Memory at ${pct}%, aborting to prevent OOM!"
+            return 1
+        fi
+        log_info "Memory now at ${pct}%, continuing..."
+    fi
+    return 0
+}
+
+log_memory_status() {
+    local mem_check=$(check_memory)
+    local pct=$(echo "$mem_check" | cut -d' ' -f1)
+    local used=$(echo "$mem_check" | cut -d' ' -f2)
+    local available=$(echo "$mem_check" | cut -d' ' -f4)
+    log_info "Memory: ${pct}% used (${used}MB), ${available}MB available"
+}
+
 check_sui_node() {
     curl -s http://127.0.0.1:9000 \
         -H 'Content-Type: application/json' \
@@ -158,27 +268,32 @@ unmount_f2fs() {
 }
 
 mount_f2fs() {
-    log_info "Mounting F2FS with FDP..."
+    local use_fdp="${1:-false}"
+    local fdp_streams=1  # Default: single stream (all data mixed = high WAF baseline)
+    
+    if [ "$use_fdp" = "true" ]; then
+        fdp_streams=8    # FDP mode: 8 streams (data separated = low WAF)
+        log_info "Mounting F2FS with FDP (8 streams - data separation enabled)..."
+    else
+        log_info "Mounting F2FS WITHOUT FDP (1 stream - all data mixed)..."
+    fi
     
     mkdir -p "$MOUNT_POINT"
     sudo "$FDP_STATS" "$NVME_DEV_PATH" --reset >/dev/null 2>&1 || true
     sudo "$FDP_TOOLS_DIR"/mkfs/mkfs.f2fs -f -O lost_found "$NVME_DEV_PATH"
-    sudo "$FDP_TOOLS_DIR/fdp_f2fs_mount" 8
+    sudo "$FDP_TOOLS_DIR/fdp_f2fs_mount" "$fdp_streams"
     sudo chmod -R 777 "$MOUNT_POINT"
     
-    # Clean up any leftover data from previous runs
-    rm -rf "$MOUNT_POINT/account_state" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/ledger" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p0/*" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p1/*" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p2/*" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p3/*" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p4/*" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p5/*" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p6/*" 2>/dev/null || true
-    rm -rf "$MOUNT_POINT/p7/*" 2>/dev/null || true
+    # CRITICAL: Force-clean all PID directories to prevent WAL corruption on restart
+    # Using sudo rm -rf to ensure all files (including root-owned) are removed
+    for pid in 0 1 2 3 4 5 6 7; do
+        sudo rm -rf "$MOUNT_POINT/p${pid}"/* 2>/dev/null || true
+        sudo rm -rf "$MOUNT_POINT/p${pid}"/.[!.]* 2>/dev/null || true  # Hidden files too
+    done
+    sync
+    sleep 1
     
-    log_success "F2FS mounted at $MOUNT_POINT"
+    log_success "F2FS mounted at $MOUNT_POINT (streams=$fdp_streams)"
 }
 
 start_sui_node() {
@@ -187,6 +302,24 @@ start_sui_node() {
     local config_dir="$MOUNT_POINT/p7/sui_config"
     
     log_info "Starting SUI node (FDP=$use_fdp)..."
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CLEANUP: Remove any existing SUI DB directories to avoid WAL corruption
+    # Prefill writes to isolated directories (prefill_sui/batch_N), but previous
+    # failed runs may have left DB state that conflicts with new genesis.
+    # ═══════════════════════════════════════════════════════════════════════════
+    log_info "Cleaning up previous SUI data..."
+    rm -rf "$config_dir" 2>/dev/null || true
+    if [ "$use_fdp" = "true" ]; then
+        # Clean FDP directories (but not prefill data)
+        rm -rf "$MOUNT_POINT/p0"/*.log "$MOUNT_POINT/p0"/WAL* 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p1/authority_db"* 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p2/authority_db"* 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p3/consensus_db"* 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p4/consensus_db"* 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p5/fullnode_db"* 2>/dev/null || true
+        rm -rf "$MOUNT_POINT/p6/fullnode_db"* 2>/dev/null || true
+    fi
     
     # Disable SUI_DISABLE_GAS for now - it causes execution issues
     # The faucet provides enough gas for benchmarking
@@ -197,11 +330,21 @@ start_sui_node() {
     # These settings force more frequent flushes and compactions to stress the SSD
     # and trigger garbage collection in FEMU
     # ═══════════════════════════════════════════════════════════════════════════
-    export MAX_WRITE_BUFFER_SIZE_MB=16          # 16MB vs 256MB default (16x smaller)
-    export MAX_WRITE_BUFFER_NUMBER=2            # 2 vs 6 default (3x fewer buffers)
-    export L0_NUM_FILES_COMPACTION_TRIGGER=2    # 2 vs 4 default (2x more frequent compaction)
-    export TARGET_FILE_SIZE_BASE_MB=8           # 8MB vs 128MB default (16x smaller files)
-    export DB_PARALLELISM=8                     # Use all 8 CPU cores for compaction
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CRITICAL: SST files SMALLER than F2FS segment (2MB) = fragmented invalidation
+    # When multiple SST files share a segment, deleting one leaves others valid
+    # GC must COPY valid blocks from surviving files → page copies → WAF > 1.0
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MEMORY-SAFE ROCKSDB SETTINGS (for 16GB RAM)
+    export MAX_WRITE_BUFFER_SIZE_MB=1           # 1MB write buffer → 1MB L0 files (< 2MB segment)
+    export MAX_WRITE_BUFFER_NUMBER=2            # 2 buffers (was 4) - reduce memory
+    export L0_NUM_FILES_COMPACTION_TRIGGER=4    # Trigger compaction at 4 L0 files
+    export TARGET_FILE_SIZE_BASE_MB=1           # 1MB SST files (< 2MB segment)
+    export ROCKSDB_BLOCK_CACHE_SIZE_MB=256      # Limit block cache to 256MB
+    # Result: ~2 SST files per F2FS segment
+    # When compaction deletes one SST, the other in same segment stays valid
+    # F2FS GC must copy valid blocks to free the segment!
+    export DB_PARALLELISM="${DB_PARALLELISM:-4}" # Use 4 cores (half) for memory safety
     
     log_info "RocksDB tuning: write_buffer=${MAX_WRITE_BUFFER_SIZE_MB}MB, L0_trigger=${L0_NUM_FILES_COMPACTION_TRIGGER}, file_size=${TARGET_FILE_SIZE_BASE_MB}MB"
     
@@ -292,6 +435,7 @@ read_femu_stats() {
         return
     fi
     
+    # Trigger FDP stats read to update FEMU log
     if [ -x "$FDP_STATS" ]; then
         timeout 10 sudo "$FDP_STATS" "$NVME_DEV_PATH" --read-only >/dev/null 2>&1 || true
         sleep 2
@@ -354,76 +498,153 @@ build_benchmark() {
 run_benchmark() {
     local mode="$1"
     local run_dir="$2"
-    local config_dir="$MOUNT_POINT/p7/sui_config"
+    local use_fdp="${3:-false}"
     
-    log_section "SDK BENCHMARK: $mode"
+    log_section "NFT BENCHMARK: $mode"
     
     local start_time=$(date +%s)
     
-    # Get package ID
-    local package_id=$(cat "$config_dir/.package_id" 2>/dev/null || echo "")
-    if [ -z "$package_id" ]; then
-        log_error "No package ID found"
-        return 1
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STORE PATH: Where sui-single-node-benchmark writes RocksDB data
+    # - Non-FDP: All data in single directory (p7)
+    # - FDP: Set env vars so it uses FDP-separated directories
+    # ═══════════════════════════════════════════════════════════════════════════
+    local store_path
+    if [ "$use_fdp" = "true" ]; then
+        # FDP mode: use p1 as base, env vars will redirect to appropriate PIDs
+        store_path="$MOUNT_POINT/p1/nft_bench"
+        export SUI_FDP_WAL_SEMANTIC=1
+        export SUI_FDP_BASE_PATH="$MOUNT_POINT"
+        export SUI_FDP_HOT_SIZE_MB=64
+        log_info "FDP mode: WAL→p0, SST hot→p1-3-5, SST cold→p2-4-6"
+    else
+        # Non-FDP: all data to single directory
+        store_path="$MOUNT_POINT/p7/nft_bench"
+        unset SUI_FDP_ENABLED SUI_FDP_BASE_PATH SUI_FDP_MODE SUI_FDP_SEMANTIC SUI_FDP_WAL_SEMANTIC
+        log_info "Non-FDP mode: all data to $store_path"
     fi
+    mkdir -p "$store_path"
     
-    log_info "Package ID: $package_id"
+    # UNIFIED WORKLOAD: Every TX does BOTH minting AND counter updates
+    local duration_min="${BENCH_DURATION_MIN:-30}"
+    local duration_sec=$((duration_min * 60))
+    
+    local tx_count="${TX_COUNT:-5000}"         # TXs per batch
+    local num_mints="${NUM_MINTS:-5}"          # NFTs per TX
+    local nft_size="${NFT_SIZE:-4000}"         # Bytes per NFT
+    local num_counters="${NUM_COUNTERS:-20}"   # Counter updates per TX
+    
+    # Estimates per batch
+    local data_per_batch_mb=$((tx_count * num_mints * nft_size / 1024 / 1024))
+    local updates_per_batch=$((tx_count * num_counters))
+    
+    log_info "UNIFIED WORKLOAD Configuration:"
+    log_info "  Store path:    $store_path"
+    log_info "  Duration:      ${duration_min} min"
+    log_info "  Per batch:     ${tx_count} TXs"
+    log_info "  Per TX:        ${num_mints} NFTs × ${nft_size}B + ${num_counters} counter updates"
+    log_info "  Batch totals:  ~${data_per_batch_mb}MB new data + ${updates_per_batch} version updates"
+    log_info ""
+    log_info "  HOW THIS WORKS:"
+    log_info "    - NFT mints fill disk rapidly (${data_per_batch_mb}MB/batch)"
+    log_info "    - Counter updates create compaction pressure (${updates_per_batch}/batch)"
+    log_info "    - Combined: disk fills + LBA reuse from compaction → GC trigger"
+    log_memory_status
     
     # Record initial disk stats
     local initial_sectors=$(get_device_sectors)
-    
-    # Reset FEMU stats
-    sudo "$FDP_STATS" "$NVME_DEV_PATH" --reset >/dev/null 2>&1 || true
+    log_info "Initial device sectors: $initial_sectors"
     
     # Record benchmark info
     {
         echo "benchmark_mode=$mode"
+        echo "strategy=unified_workload"
         echo "start_time=$(date -Iseconds)"
         echo "start_sectors=$initial_sectors"
-        echo "duration=$DURATION"
-        echo "workers=$WORKERS"
-        echo "batch_size=$BATCH_SIZE"
-        echo "max_inflight=$MAX_INFLIGHT"
-        echo "create_pct=$CREATE_PCT"
-        echo "seed_objects=$SEED_OBJECTS"
+        echo "store_path=$store_path"
+        echo "duration_min=$duration_min"
+        echo "tx_count=$tx_count"
+        echo "num_mints=$num_mints"
+        echo "nft_size=$nft_size"
+        echo "num_counters=$num_counters"
+        echo "use_fdp=$use_fdp"
     } > "$run_dir/benchmark_info.txt"
     
-    log_info "Starting SDK benchmark..."
-    log_info "  Duration:     ${DURATION}s"
-    log_info "  Workers:      $WORKERS"
-    log_info "  Batch Size:   $BATCH_SIZE"
-    log_info "  Max Inflight: $MAX_INFLIGHT"
-    log_info "  Create %:     $CREATE_PCT"
-    log_info "  Use Blobs:    $USE_BLOBS"
+    # ═══════════════════════════════════════════════════════════════════════════
+    # UNIFIED WORKLOAD: NFT mints + counter updates in every batch
+    # ═══════════════════════════════════════════════════════════════════════════
+    log_info ""
+    log_info "═══════════════════════════════════════════════════════════════"
+    log_info "  UNIFIED WORKLOAD: Running for ${duration_min} minutes"
+    log_info "═══════════════════════════════════════════════════════════════"
     
-    # Build the benchmark command
-    local bench_cmd=(
-        "$BENCH_BINARY"
-        --rpc-url "http://127.0.0.1:9000"
-        --package-id "$package_id"
-        --duration "$DURATION"
-        --workers "$WORKERS"
-        --batch-size "$BATCH_SIZE"
-        --max-inflight "$MAX_INFLIGHT"
-        --create-pct "$CREATE_PCT"
-        --seed-objects "$SEED_OBJECTS"
-        --gas-budget "$GAS_BUDGET"
-        --stats-interval 30
-        --output "$run_dir/bench_results.json"
-    )
+    local bench_start=$(date +%s)
+    local bench_deadline=$((bench_start + duration_sec))
+    local gc_before=$(cat /sys/fs/f2fs/$NVME_DEVICE/gc_foreground_calls 2>/dev/null || echo 0)
+    local batch_num=1
+    local total_data_mb=0
     
-    # Add --use-blobs flag if enabled
-    if [ "$USE_BLOBS" = "yes" ]; then
-        bench_cmd+=(--use-blobs)
-    fi
+    while [ $(date +%s) -lt $bench_deadline ]; do
+        local current_pct=$(df "$MOUNT_POINT" | awk 'NR==2{print int($5)}')
+        local gc_now=$(cat /sys/fs/f2fs/$NVME_DEVICE/gc_foreground_calls 2>/dev/null || echo 0)
+        local gc_delta=$((gc_now - gc_before))
+        local elapsed=$(($(date +%s) - bench_start))
+        local remaining=$((bench_deadline - $(date +%s)))
+        local mem_pct=$(check_memory | cut -d' ' -f1)
+        
+        log_info "Batch $batch_num: disk ${current_pct}%, mem ${mem_pct}%, GC +${gc_delta}, ${remaining}s remaining"
+        
+        # Memory safety check - CRITICAL
+        if ! wait_for_memory; then
+            log_warning "Memory pressure - forcing cleanup..."
+            sync
+            sudo sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
+            sleep 3
+            if ! wait_for_memory; then
+                log_error "Memory still critical after cleanup - aborting batch"
+                sleep 5
+                continue
+            fi
+        fi
+        
+        # Append flag for all batches after first
+        local append_flag=""
+        if [ $batch_num -gt 1 ]; then
+            append_flag="--append"
+        fi
+        
+        # UNIFIED: Both NFT mints AND counter updates in EVERY transaction
+        "$SUI_SINGLE_NODE_BENCH" \
+            --tx-count "$tx_count" \
+            --component baseline \
+            --store-path "$store_path" \
+            $append_flag \
+            ptb --num-mints "$num_mints" --nft-size "$nft_size" --num-shared-objects "$num_counters" \
+            2>&1 | tee -a "$run_dir/workload.log" | grep -E "TPS=|Execution|error" | tail -2
+        
+        batch_num=$((batch_num + 1))
+        total_data_mb=$((total_data_mb + data_per_batch_mb))
+        
+        # MEMORY CLEANUP after every batch - CRITICAL for stability
+        sync
+        sudo sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
+        sleep 1
+    done
     
-    # Run the benchmark
-    "${bench_cmd[@]}" 2>&1 | tee "$run_dir/bench.log"
+    local bench_elapsed=$(($(date +%s) - bench_start))
+    local gc_after=$(cat /sys/fs/f2fs/$NVME_DEVICE/gc_foreground_calls 2>/dev/null || echo 0)
+    local total_gc=$((gc_after - gc_before))
+    local final_pct=$(df "$MOUNT_POINT" | awk 'NR==2{print int($5)}')
+    
+    log_success "Benchmark complete: ${bench_elapsed}s, $((batch_num-1)) batches, ~${total_data_mb}MB written"
+    log_info "Final disk: ${final_pct}%, GC calls: +$total_gc"
     
     local end_time=$(date +%s)
     local total_duration=$((end_time - start_time))
     
+    # ═══════════════════════════════════════════════════════════════════════════
     # Collect final stats
+    # ═══════════════════════════════════════════════════════════════════════════
     local final_sectors=$(get_device_sectors)
     local delta_sectors=$((final_sectors - initial_sectors))
     local delta_bytes=$((delta_sectors * 512))
@@ -499,38 +720,36 @@ run_benchmark() {
 }
 
 run_fdp_disabled_benchmark() {
-    log_section "NON-FDP SDK BENCHMARK"
+    log_section "NON-FDP NFT BENCHMARK (single-stream = data mixing)"
     local run_dir="$RESULTS_DIR/nfdp"
-    local config_dir="$MOUNT_POINT/p7/sui_config"
     mkdir -p "$run_dir"
     
     stop_sui_node
     unmount_f2fs
-    mount_f2fs
-    start_sui_node "false"
-    publish_contract "$config_dir"
+    mount_f2fs "false"    # Single stream - all data mixed = HIGH WAF baseline
     
-    run_benchmark "nofdp" "$run_dir"
+    # NO prefill needed - run_benchmark handles disk fill via NFT minting
+    # NO SUI node needed - sui-single-node-benchmark runs self-contained
     
-    stop_sui_node
+    run_benchmark "nofdp" "$run_dir" "false"
+    
     unmount_f2fs
 }
 
 run_fdp_enabled_benchmark() {
-    log_section "FDP-ENABLED SDK BENCHMARK"
+    log_section "FDP-ENABLED NFT BENCHMARK (8 streams = data separation)"
     local run_dir="$RESULTS_DIR/fdp"
-    local config_dir="$MOUNT_POINT/p7/sui_config"
     mkdir -p "$run_dir"
     
     stop_sui_node
     unmount_f2fs
-    mount_f2fs
-    start_sui_node "true"
-    publish_contract "$config_dir"
+    mount_f2fs "true"     # 8 streams - data separated = LOW WAF with FDP
     
-    run_benchmark "fdp" "$run_dir"
+    # NO prefill needed - run_benchmark handles disk fill via NFT minting
+    # NO SUI node needed - sui-single-node-benchmark runs self-contained
     
-    stop_sui_node
+    run_benchmark "fdp" "$run_dir" "true"
+    
     unmount_f2fs
 }
 
@@ -541,29 +760,64 @@ run_fdp_enabled_benchmark() {
 main() {
     mkdir -p "$RESULTS_DIR" "$LOG_DIR"
     
-    log_section "FDP SDK Benchmark for SUI Blockchain"
+    log_section "FDP NFT Benchmark for SUI Blockchain"
     log_info ""
     log_info "╔═══════════════════════════════════════════════════════════════════════╗"
-    log_info "║  SDK-BASED BENCHMARK: Direct Transaction Submission                   ║"
+    log_info "║  UPDATE-HEAVY BENCHMARK: Realistic steady-state workload              ║"
     log_info "╠═══════════════════════════════════════════════════════════════════════╣"
-    log_info "║  No CLI overhead - uses SUI SDK directly                              ║"
-    log_info "║  Async connection pooling for high throughput                         ║"
-    log_info "║  Proper concurrency control with semaphores                           ║"
+    log_info "║  Real blockchains: Create objects ONCE, UPDATE them MILLIONS of times ║"
+    log_info "║  - SETUP:   Short phase to create initial state + counters            ║"
+    log_info "║  - UPDATE:  Long phase hammering counter updates (realistic workload) ║"
+    log_info "║  - CLEANUP: Let GC catch up with light updates                        ║"
     log_info "╚═══════════════════════════════════════════════════════════════════════╝"
     log_info ""
-    log_info "Configuration:"
-    log_info "  Duration:      ${DURATION}s"
-    log_info "  Workers:       $WORKERS"
-    log_info "  Batch Size:    $BATCH_SIZE"
-    log_info "  Max Inflight:  $MAX_INFLIGHT"
-    log_info "  Create %:      $CREATE_PCT"
+    
+    # UNIFIED WORKLOAD parameters (use global vars set based on WORKLOAD_MODE)
+    local duration_min="${BENCH_DURATION_MIN:-30}"
+    local tx_count="${TX_COUNT:-5000}"
+    local num_mints="${NUM_MINTS}"
+    local nft_size="${NFT_SIZE}"
+    local num_counters="${NUM_COUNTERS}"
+    local data_per_batch_mb=$((tx_count * num_mints * nft_size / 1024 / 1024))
+    local updates_per_batch=$((tx_count * num_counters))
+    local workload_mode="${WORKLOAD_MODE:-balanced}"
+    
+    log_info "UNIFIED WORKLOAD Configuration (mode: $workload_mode):"
+    log_info "  Duration:        ${duration_min} min per mode (like Solana --duration)"
+    log_info "  Per batch:       ${tx_count} TXs (like Solana --tx-count)"
+    log_info "  Per TX:          ${num_mints} NFTs × ${nft_size}B + ${num_counters} counter updates"
+    log_info "  Batch totals:    ~${data_per_batch_mb}MB new data + ${updates_per_batch} version updates"
+    log_info "  Memory limit:    ${MAX_MEMORY_PCT:-60}% (auto-pause + drop_caches between batches)"
+    log_info ""
+    log_info "╔═══════════════════════════════════════════════════════════════════════╗"
+    log_info "║  COMPARISON TO SOLANA BENCH-TPS:                                      ║"
+    log_info "║  ─────────────────────────────────────────────────────────────────────║"
+    log_info "║  Solana bench-tps:        SUI equivalent:                             ║"
+    log_info "║  • Transfer 1 lamport  →  • Counter update (state change)             ║"
+    log_info "║  • Fund keypairs       →  • NFT mint (create objects)                 ║"
+    log_info "║  • --tx-count          →  • TX_COUNT=$tx_count                          ║"
+    log_info "║  • --duration          →  • BENCH_DURATION_MIN=$duration_min                     ║"
+    log_info "║  • --sustained         →  • Continuous batch loop                     ║"
+    log_info "║  ─────────────────────────────────────────────────────────────────────║"
+    log_info "║  Counter updates = state churn (like Solana transfers)                ║"
+    log_info "║  NFT mints = bulk data (Solana uses tiny txs, we need disk I/O)       ║"
+    log_info "╚═══════════════════════════════════════════════════════════════════════╝"
+    log_info ""
+    log_info "╔═══════════════════════════════════════════════════════════════════════╗"
+    log_info "║  FDP Comparison Strategy:                                             ║"
+    log_info "║  • Non-FDP: F2FS with fdp_log_n=1 (single stream, all data mixed)    ║"
+    log_info "║  • FDP:     F2FS with fdp_log_n=8 (8 streams, data separated)        ║"
+    log_info "║  Expected: Non-FDP shows HIGH WAF, FDP shows LOW WAF (~1.0)          ║"
+    log_info "╚═══════════════════════════════════════════════════════════════════════╝"
     log_info ""
     
-    # Build benchmark binary
-    build_benchmark || {
-        log_error "Failed to build benchmark"
+    # Verify sui-single-node-benchmark exists
+    if [ ! -x "$SUI_SINGLE_NODE_BENCH" ]; then
+        log_error "sui-single-node-benchmark not found at $SUI_SINGLE_NODE_BENCH"
+        log_error "Build it: cd /home/femu/sui && cargo build --release -p sui-single-node-benchmark"
         exit 1
-    }
+    fi
+    log_success "Using sui-single-node-benchmark: $SUI_SINGLE_NODE_BENCH"
     
     log_info "Caching sudo credentials..."
     sudo -v || { log_error "sudo access required"; exit 1; }

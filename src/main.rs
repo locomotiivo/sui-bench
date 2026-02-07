@@ -25,7 +25,10 @@ use clap::Parser;
 use futures::{StreamExt, stream::FuturesUnordered};
 use rand::Rng;
 use rand::SeedableRng;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use serde::{Serialize, Deserialize};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sui_sdk::{SuiClient, SuiClientBuilder};
@@ -35,7 +38,7 @@ use sui_sdk::rpc_types::{
 };
 use sui_sdk::types::{
     base_types::{ObjectID, ObjectRef, SuiAddress},
-    crypto::{get_key_pair, SuiKeyPair, AccountKeyPair, KeypairTraits},
+    crypto::{get_key_pair, SuiKeyPair, AccountKeyPair, KeypairTraits, EncodeDecodeBase64},
     programmable_transaction_builder::ProgrammableTransactionBuilder,
     transaction::{Transaction, TransactionData},
     transaction_driver_types::ExecuteTransactionRequestType,
@@ -44,6 +47,55 @@ use sui_sdk::types::{
 use tokio::sync::{Semaphore, RwLock};
 use tokio::time::sleep;
 use tracing::{info, warn, error, debug};
+
+/// Maximum objects tracked per worker to prevent memory bloat
+const MAX_TRACKED_OBJECTS_PER_WORKER: usize = 5000;
+
+/// Memory pressure levels for graduated throttling
+/// Level 0: Normal operation
+/// Level 1: Light throttle (75-85% memory) - small delay, keep 75% objects
+/// Level 2: Heavy throttle (85-92% memory) - longer delay, keep 50% objects  
+/// Level 3: Emergency throttle (>92% memory) - max delay, keep 25% objects, skip creates
+const MEM_PRESSURE_NORMAL: u8 = 0;
+const MEM_PRESSURE_LIGHT: u8 = 1;
+const MEM_PRESSURE_HEAVY: u8 = 2;
+const MEM_PRESSURE_EMERGENCY: u8 = 3;
+
+/// Get memory usage percentage (0.0 - 1.0) by reading /proc/meminfo
+fn get_memory_usage_pct() -> f64 {
+    let file = match File::open("/proc/meminfo") {
+        Ok(f) => f,
+        Err(_) => return 0.0, // Can't read, assume OK
+    };
+    let reader = BufReader::new(file);
+    
+    let mut mem_total: u64 = 0;
+    let mut mem_available: u64 = 0;
+    
+    for line in reader.lines().flatten() {
+        if line.starts_with("MemTotal:") {
+            mem_total = line.split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        } else if line.starts_with("MemAvailable:") {
+            mem_available = line.split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        }
+        if mem_total > 0 && mem_available > 0 {
+            break;
+        }
+    }
+    
+    if mem_total == 0 {
+        return 0.0;
+    }
+    
+    let used = mem_total.saturating_sub(mem_available);
+    used as f64 / mem_total as f64
+}
 
 /// FDP SUI Benchmark - High-throughput I/O load generator
 #[derive(Parser, Debug, Clone)]
@@ -61,36 +113,52 @@ struct Args {
     #[clap(long, default_value = "300")]
     duration: u64,
 
-    /// Number of concurrent workers
-    #[clap(long, default_value = "32")]
+    /// Number of concurrent workers (keep low for VM stability!)
+    #[clap(long, default_value = "8")]
     workers: usize,
 
     /// Objects per transaction batch (higher = more I/O per TX)
-    #[clap(long, default_value = "100")]
+    #[clap(long, default_value = "50")]
     batch_size: usize,
 
     /// Target transactions per second (0 = unlimited)
     #[clap(long, default_value = "0")]
     target_tps: u64,
 
-    /// Maximum concurrent in-flight transactions
-    #[clap(long, default_value = "500")]
+    /// Maximum concurrent in-flight transactions (keep low for VM stability!)
+    #[clap(long, default_value = "100")]
     max_inflight: usize,
 
-    /// Percentage of CREATE operations (vs UPDATE)
-    #[clap(long, default_value = "30")]
+    /// Percentage of CREATE operations (vs UPDATE) - keep low to reduce memory growth!
+    #[clap(long, default_value = "5")]
     create_pct: u8,
 
     /// Initial seed objects to create per worker
-    #[clap(long, default_value = "200")]
+    #[clap(long, default_value = "500")]
     seed_objects: usize,
+
+    /// Maximum tracked objects per worker (caps memory usage)
+    #[clap(long, default_value = "5000")]
+    max_tracked_objects: usize,
+
+    /// Memory usage threshold (0.0-1.0) above which to throttle (default: 0.75 = 75%)
+    #[clap(long, default_value = "0.75")]
+    memory_threshold: f64,
+
+    /// Critical memory threshold that stops all workers (default: 0.85 = 85%)
+    #[clap(long, default_value = "0.85")]
+    memory_critical: f64,
+
+    /// Emergency memory threshold that aborts benchmark (default: 0.92 = 92%)
+    #[clap(long, default_value = "0.92")]
+    memory_emergency: f64,
 
     /// Gas budget per transaction
     #[clap(long, default_value = "500000000")]
     gas_budget: u64,
 
     /// Stats reporting interval in seconds
-    #[clap(long, default_value = "10")]
+    #[clap(long, default_value = "30")]
     stats_interval: u64,
 
     /// Use 4KB LargeBlob objects instead of MicroCounters for more I/O per TX
@@ -104,14 +172,96 @@ struct Args {
     /// Keystore path for signing transactions
     #[clap(long)]
     keystore: Option<String>,
+
+    /// Save created/tracked objects to file (for use with --load-objects in next phase)
+    #[clap(long)]
+    save_objects: Option<String>,
+
+    /// Load objects from file instead of creating seed objects (use objects from previous phase)
+    #[clap(long)]
+    load_objects: Option<String>,
 }
 
 /// Tracked object for updates
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrackedObject {
+    #[serde(with = "object_id_serde")]
     id: ObjectID,
     version: u64,
+    #[serde(with = "object_digest_serde")]
     digest: sui_sdk::types::base_types::ObjectDigest,
+}
+
+/// Custom serde for ObjectID (serialize as hex string)
+mod object_id_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use sui_sdk::types::base_types::ObjectID;
+    use std::str::FromStr;
+
+    pub fn serialize<S>(id: &ObjectID, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        id.to_string().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ObjectID, D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(deserializer)?;
+        ObjectID::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Custom serde for ObjectDigest (serialize as base58 string)
+mod object_digest_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use sui_sdk::types::base_types::ObjectDigest;
+    use std::str::FromStr;
+
+    pub fn serialize<S>(digest: &ObjectDigest, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        digest.to_string().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ObjectDigest, D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(deserializer)?;
+        ObjectDigest::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Serializable worker objects for save/load between phases
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedWorkerObjects {
+    worker_id: usize,
+    #[serde(with = "sui_address_serde")]
+    address: SuiAddress,
+    /// Base64-encoded keypair bytes for restoring worker identity
+    keypair_base64: String,
+    objects: Vec<TrackedObject>,
+}
+
+/// Custom serde for SuiAddress
+mod sui_address_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use sui_sdk::types::base_types::SuiAddress;
+    use std::str::FromStr;
+
+    pub fn serialize<S>(addr: &SuiAddress, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        addr.to_string().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SuiAddress, D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(deserializer)?;
+        SuiAddress::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Full saved state for all workers
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedBenchmarkState {
+    total_objects: usize,
+    workers: Vec<SavedWorkerObjects>,
 }
 
 /// Worker state
@@ -189,6 +339,8 @@ async fn main() -> Result<()> {
     info!("  Max Inflight:  {}", args.max_inflight);
     info!("  Create %:      {}%", args.create_pct);
     info!("  Seed Objects:  {} per worker", args.seed_objects);
+    info!("  Memory Limit:  {:.0}% throttle, {:.0}% critical, {:.0}% abort", 
+          args.memory_threshold * 100.0, args.memory_critical * 100.0, args.memory_emergency * 100.0);
     info!("");
 
     // Parse package ID
@@ -222,64 +374,117 @@ async fn main() -> Result<()> {
     info!("Initializing {} workers in parallel...", args.workers);
     let init_start = Instant::now();
     
-    // Create all keypairs first (fast, no I/O)
-    let keypairs: Vec<_> = (0..args.workers)
-        .map(|i| {
-            let (address, keypair): (SuiAddress, AccountKeyPair) = get_key_pair();
-            (i, address, keypair)
-        })
-        .collect();
-    
-    // Request gas from faucet in parallel batches (to avoid overwhelming faucet)
-    let batch_size = 8; // Process 8 workers at a time
+    // Worker initialization depends on whether we're loading from previous phase
     let mut workers = Vec::new();
     
-    for chunk in keypairs.chunks(batch_size) {
-        let mut faucet_futures = Vec::new();
-        for (i, address, keypair) in chunk {
-            let client = client.clone();
-            let addr = *address;
-            let id = *i;
-            let kp = keypair.copy();
-            faucet_futures.push(async move {
-                let gas_coin = request_gas_from_faucet(&client, addr).await?;
-                Ok::<_, anyhow::Error>((id, addr, kp, gas_coin))
-            });
-        }
+    if let Some(load_path) = &args.load_objects {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // LOAD MODE: Restore workers from saved state (same keypairs = same ownership)
+        // ═══════════════════════════════════════════════════════════════════════════
+        info!("Loading workers and objects from {}...", load_path);
+        let load_start = Instant::now();
         
-        // Execute batch in parallel
-        let results = futures::future::join_all(faucet_futures).await;
-        for result in results {
-            let (id, address, keypair, gas_coin) = result?;
-            info!("Worker {}: ready", id);
+        let file_content = std::fs::read_to_string(load_path)
+            .context(format!("Failed to read objects file: {}", load_path))?;
+        let saved_state: SavedBenchmarkState = serde_json::from_str(&file_content)
+            .context("Failed to parse objects file")?;
+        
+        info!("Found {} saved workers with {} total objects", 
+            saved_state.workers.len(), saved_state.total_objects);
+        
+        // Restore workers with their original keypairs
+        for saved_worker in &saved_state.workers {
+            // Decode the keypair from base64
+            let keypair = SuiKeyPair::decode_base64(&saved_worker.keypair_base64)
+                .context(format!("Failed to decode keypair for worker {}", saved_worker.worker_id))?;
+            
+            // Request gas for this address (same address that owns the objects)
+            let gas_coin = request_gas_from_faucet(&client, saved_worker.address).await?;
+            
+            info!("Worker {}: restored with {} objects (address: {})", 
+                saved_worker.worker_id, saved_worker.objects.len(), 
+                &saved_worker.address.to_string()[..16]);
+            
             workers.push(Arc::new(RwLock::new(WorkerState {
-                id,
-                address,
-                keypair: SuiKeyPair::Ed25519(keypair),
+                id: saved_worker.worker_id,
+                address: saved_worker.address,
+                keypair,
                 gas_coin,
-                objects: Vec::new(),
+                objects: saved_worker.objects.clone(),
             })));
         }
-    }
-    info!("Workers initialized in {:.1}s", init_start.elapsed().as_secs_f64());
+        
+        info!("Loaded {} workers in {:.1}s", workers.len(), load_start.elapsed().as_secs_f64());
+        
+        // Refresh object versions from chain (objects may have been updated since save)
+        info!("Refreshing object versions from chain...");
+        let refresh_start = Instant::now();
+        for worker in &workers {
+            refresh_worker_objects(&client, worker.clone()).await?;
+        }
+        info!("Object versions refreshed in {:.1}s", refresh_start.elapsed().as_secs_f64());
+        
+    } else {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // FRESH MODE: Create new workers with random keypairs
+        // ═══════════════════════════════════════════════════════════════════════════
+        let keypairs: Vec<_> = (0..args.workers)
+            .map(|i| {
+                let (address, keypair): (SuiAddress, AccountKeyPair) = get_key_pair();
+                (i, address, keypair)
+            })
+            .collect();
+        
+        // Request gas from faucet in parallel batches (to avoid overwhelming faucet)
+        let batch_size = 8; // Process 8 workers at a time
+        
+        for chunk in keypairs.chunks(batch_size) {
+            let mut faucet_futures = Vec::new();
+            for (i, address, keypair) in chunk {
+                let client = client.clone();
+                let addr = *address;
+                let id = *i;
+                let kp = keypair.copy();
+                faucet_futures.push(async move {
+                    let gas_coin = request_gas_from_faucet(&client, addr).await?;
+                    Ok::<_, anyhow::Error>((id, addr, kp, gas_coin))
+                });
+            }
+            
+            // Execute batch in parallel
+            let results = futures::future::join_all(faucet_futures).await;
+            for result in results {
+                let (id, address, keypair, gas_coin) = result?;
+                info!("Worker {}: ready", id);
+                workers.push(Arc::new(RwLock::new(WorkerState {
+                    id,
+                    address,
+                    keypair: SuiKeyPair::Ed25519(keypair),
+                    gas_coin,
+                    objects: Vec::new(),
+                })));
+            }
+        }
+        info!("Workers initialized in {:.1}s", init_start.elapsed().as_secs_f64());
 
-    // Create seed objects for each worker IN PARALLEL
-    info!("Creating seed objects ({} per worker) in parallel...", args.seed_objects);
-    let seed_start = Instant::now();
-    let mut seed_futures = Vec::new();
-    for worker in &workers {
-        let client = client.clone();
-        let w = worker.clone();
-        seed_futures.push(async move {
-            create_seed_objects(&client, w, package_id, args.seed_objects, args.gas_budget).await
-        });
+        // Create seed objects for each worker IN PARALLEL
+        info!("Creating seed objects ({} per worker) in parallel...", args.seed_objects);
+        let seed_start = Instant::now();
+        let mut seed_futures = Vec::new();
+        for worker in &workers {
+            let client = client.clone();
+            let w = worker.clone();
+            seed_futures.push(async move {
+                create_seed_objects(&client, w, package_id, args.seed_objects, args.gas_budget).await
+            });
+        }
+        // Execute all seed creations in parallel
+        let seed_results = futures::future::join_all(seed_futures).await;
+        for result in seed_results {
+            result?;
+        }
+        info!("Seed objects created in {:.1}s", seed_start.elapsed().as_secs_f64());
     }
-    // Execute all seed creations in parallel
-    let seed_results = futures::future::join_all(seed_futures).await;
-    for result in seed_results {
-        result?;
-    }
-    info!("Seed objects created in {:.1}s", seed_start.elapsed().as_secs_f64());
 
     // Initialize stats AFTER setup - this ensures DURATION measures actual benchmark time
     let stats = Arc::new(BenchStats::new());
@@ -301,16 +506,65 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Memory pressure level (0-3) for graduated throttling - NEVER abort, only throttle
+    let memory_pressure = Arc::new(AtomicU8::new(MEM_PRESSURE_NORMAL));
+    
+    // Start memory monitor task
+    let memory_pressure_clone = memory_pressure.clone();
+    let running_clone = running.clone();
+    let mem_threshold = args.memory_threshold;
+    let mem_critical = args.memory_critical;
+    let mem_emergency = args.memory_emergency;
+    tokio::spawn(async move {
+        let mut last_level = MEM_PRESSURE_NORMAL;
+        let mut last_log_time = Instant::now();
+        
+        while running_clone.load(Ordering::Relaxed) {
+            let usage = get_memory_usage_pct();
+            
+            let new_level = if usage >= mem_emergency {
+                MEM_PRESSURE_EMERGENCY  // >92%: max throttle (but NO abort!)
+            } else if usage >= mem_critical {
+                MEM_PRESSURE_HEAVY      // >85%: heavy throttle
+            } else if usage >= mem_threshold {
+                MEM_PRESSURE_LIGHT      // >75%: light throttle
+            } else {
+                MEM_PRESSURE_NORMAL     // <75%: normal operation
+            };
+            
+            // Log level changes or periodic updates during pressure
+            if new_level != last_level || (new_level > MEM_PRESSURE_NORMAL && last_log_time.elapsed() > Duration::from_secs(30)) {
+                match new_level {
+                    MEM_PRESSURE_EMERGENCY => warn!("🔴 EMERGENCY THROTTLE: {:.1}% - max delay, dropping 75% objects, skipping creates", usage * 100.0),
+                    MEM_PRESSURE_HEAVY => warn!("🟠 HEAVY THROTTLE: {:.1}% - long delay, dropping 50% objects", usage * 100.0),
+                    MEM_PRESSURE_LIGHT => warn!("🟡 LIGHT THROTTLE: {:.1}% - small delay, dropping 25% objects", usage * 100.0),
+                    _ => if last_level > MEM_PRESSURE_NORMAL {
+                        info!("🟢 Memory recovered: {:.1}% - resuming normal operation", usage * 100.0);
+                    },
+                }
+                last_level = new_level;
+                last_log_time = Instant::now();
+            }
+            
+            memory_pressure_clone.store(new_level, Ordering::Relaxed);
+            
+            // Check every 500ms for faster reaction to memory spikes
+            sleep(Duration::from_millis(500)).await;
+        }
+    });
+
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let mut handles = FuturesUnordered::new();
 
-    // Spawn worker tasks
-    for worker in workers {
+    // Spawn worker tasks (clone worker refs so we can still access them after benchmark)
+    for worker in &workers {
         let client = client.clone();
         let args = args.clone();
         let stats = stats.clone();
         let running = running.clone();
         let semaphore = semaphore.clone();
+        let memory_pressure = memory_pressure.clone();
+        let worker = worker.clone();  // Clone the Arc
 
         let handle = tokio::spawn(async move {
             run_worker(
@@ -323,6 +577,7 @@ async fn main() -> Result<()> {
                 semaphore,
                 deadline,
                 cached_rgp,
+                memory_pressure,
             ).await
         });
 
@@ -367,6 +622,40 @@ async fn main() -> Result<()> {
 
         std::fs::write(output_path, serde_json::to_string_pretty(&result)?)?;
         info!("Results written to {}", output_path);
+    }
+
+    // Save objects to file if requested (for use in next phase)
+    if let Some(save_path) = &args.save_objects {
+        info!("Saving objects and keypairs to {}...", save_path);
+        
+        let mut saved_workers = Vec::new();
+        let mut total_objects = 0usize;
+        
+        for worker in &workers {
+            let state = worker.read().await;
+            total_objects += state.objects.len();
+            
+            // Encode keypair to base64 for portability
+            let keypair_base64 = state.keypair.encode_base64();
+            
+            saved_workers.push(SavedWorkerObjects {
+                worker_id: state.id,
+                address: state.address,
+                keypair_base64,
+                objects: state.objects.clone(),
+            });
+        }
+        
+        let saved_state = SavedBenchmarkState {
+            total_objects,
+            workers: saved_workers,
+        };
+        
+        let json = serde_json::to_string_pretty(&saved_state)?;
+        let mut file = File::create(save_path)?;
+        file.write_all(json.as_bytes())?;
+        
+        info!("Saved {} objects and {} worker keypairs to {}", total_objects, workers.len(), save_path);
     }
 
     Ok(())
@@ -514,11 +803,14 @@ async fn create_seed_objects(
             if let Some(changes) = &response.object_changes {
                 for change in changes {
                     if let sui_sdk::rpc_types::ObjectChange::Created { object_id, version, digest, .. } = change {
-                        state.objects.push(TrackedObject {
-                            id: *object_id,
-                            version: version.value(),
-                            digest: *digest,
-                        });
+                        // Cap tracked objects to prevent memory bloat
+                        if state.objects.len() < MAX_TRACKED_OBJECTS_PER_WORKER {
+                            state.objects.push(TrackedObject {
+                                id: *object_id,
+                                version: version.value(),
+                                digest: *digest,
+                            });
+                        }
                     }
                 }
             }
@@ -527,6 +819,60 @@ async fn create_seed_objects(
         debug!("Worker {}: created {} seed objects, total: {}", state.id, batch, state.objects.len());
     }
 
+    Ok(())
+}
+
+/// Refresh object versions from chain (needed when loading objects from previous phase)
+async fn refresh_worker_objects(
+    client: &SuiClient,
+    worker: Arc<RwLock<WorkerState>>,
+) -> Result<()> {
+    let mut state = worker.write().await;
+    
+    if state.objects.is_empty() {
+        return Ok(());
+    }
+    
+    // Query objects in batches to get current versions
+    let batch_size = 50;
+    let mut refreshed_objects = Vec::new();
+    
+    for chunk in state.objects.chunks(batch_size) {
+        let object_ids: Vec<ObjectID> = chunk.iter().map(|o| o.id).collect();
+        
+        let response = client
+            .read_api()
+            .multi_get_object_with_options(
+                object_ids.clone(),
+                sui_sdk::rpc_types::SuiObjectDataOptions::new()
+                    .with_owner(),
+            )
+            .await
+            .context("Failed to query objects")?;
+        
+        for obj_response in response {
+            if let Some(data) = obj_response.data {
+                refreshed_objects.push(TrackedObject {
+                    id: data.object_id,
+                    version: data.version.value(),
+                    digest: data.digest,
+                });
+            }
+        }
+    }
+    
+    let old_count = state.objects.len();
+    let new_count = refreshed_objects.len();
+    
+    state.objects = refreshed_objects;
+    
+    if new_count < old_count {
+        debug!("Worker {}: refreshed {} objects ({} no longer exist)", 
+            state.id, new_count, old_count - new_count);
+    } else {
+        debug!("Worker {}: refreshed {} objects", state.id, new_count);
+    }
+    
     Ok(())
 }
 
@@ -541,11 +887,94 @@ async fn run_worker(
     semaphore: Arc<Semaphore>,
     deadline: Instant,
     cached_rgp: u64,
+    memory_pressure: Arc<AtomicU8>,
 ) -> Result<()> {
     // Use StdRng which is Send (unlike thread_rng)
     let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut consecutive_failures = 0u32;
+    const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+    const BACKOFF_ON_FAILURE: Duration = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
     while running.load(Ordering::Relaxed) && Instant::now() < deadline {
+        // Graduated memory pressure throttling
+        let pressure_level = memory_pressure.load(Ordering::Relaxed);
+        
+        if pressure_level > MEM_PRESSURE_NORMAL {
+            // Apply throttling based on pressure level
+            let (drop_pct, delay_ms, skip_creates) = match pressure_level {
+                MEM_PRESSURE_EMERGENCY => (75, 2000, true),   // Drop 75%, 2s delay, no creates
+                MEM_PRESSURE_HEAVY => (50, 1000, false),      // Drop 50%, 1s delay
+                MEM_PRESSURE_LIGHT => (25, 250, false),       // Drop 25%, 250ms delay
+                _ => (0, 0, false),
+            };
+            
+            // Drop tracked objects to free memory
+            if drop_pct > 0 {
+                let mut state = worker.write().await;
+                let before = state.objects.len();
+                if before > 50 {
+                    let keep = before * (100 - drop_pct) / 100;
+                    state.objects.truncate(keep);
+                    debug!("Pressure L{}: dropped {} objects (keeping {})", pressure_level, before - keep, keep);
+                }
+            }
+            
+            // Delay to let memory recover
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            
+            // At emergency level, skip creates entirely and only do updates
+            if skip_creates {
+                let state = worker.read().await;
+                if state.objects.is_empty() {
+                    // No objects to update - just wait
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                drop(state);
+                
+                // Force update-only operation
+                let _permit = semaphore.acquire().await?;
+                let result = if args.use_blobs {
+                    execute_update_blob_batch(&client, &worker, package_id, args.batch_size, args.gas_budget, cached_rgp).await
+                } else {
+                    execute_update_batch(&client, &worker, package_id, args.batch_size, args.gas_budget, cached_rgp).await
+                };
+                
+                stats.tx_submitted.fetch_add(1, Ordering::Relaxed);
+                match result {
+                    Ok((created, updated)) => {
+                        stats.tx_success.fetch_add(1, Ordering::Relaxed);
+                        stats.objects_created.fetch_add(created, Ordering::Relaxed);
+                        stats.objects_updated.fetch_add(updated, Ordering::Relaxed);
+                        consecutive_failures = 0;
+                    }
+                    Err(_) => {
+                        stats.tx_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
+        }
+        
+        // Adaptive throttling based on failure rate
+        let total = stats.tx_submitted.load(Ordering::Relaxed);
+        let failed = stats.tx_failed.load(Ordering::Relaxed);
+        
+        if total > 100 {
+            let failure_rate = failed as f64 / total as f64;
+            if failure_rate > 0.30 {
+                // Critical: >30% failure rate - pause significantly
+                warn!("Critical failure rate ({:.1}%) - pausing 5s", failure_rate * 100.0);
+                sleep(Duration::from_secs(5)).await;
+            } else if failure_rate > 0.10 {
+                // High: >10% failure rate - slow down
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+
         // Acquire permit
         let _permit = semaphore.acquire().await?;
 
@@ -575,10 +1004,22 @@ async fn run_worker(
                 stats.tx_success.fetch_add(1, Ordering::Relaxed);
                 stats.objects_created.fetch_add(created, Ordering::Relaxed);
                 stats.objects_updated.fetch_add(updated, Ordering::Relaxed);
+                consecutive_failures = 0;  // Reset on success
             }
             Err(e) => {
                 stats.tx_failed.fetch_add(1, Ordering::Relaxed);
                 debug!("Transaction failed: {:?}", e);
+                
+                // Exponential backoff on consecutive failures
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    let backoff = std::cmp::min(
+                        BACKOFF_ON_FAILURE * consecutive_failures,
+                        MAX_BACKOFF
+                    );
+                    warn!("Worker: {} consecutive failures, backing off {:?}", consecutive_failures, backoff);
+                    sleep(backoff).await;
+                }
             }
         }
 
@@ -649,11 +1090,14 @@ async fn execute_create_batch(
         if let Some(changes) = &response.object_changes {
             for change in changes {
                 if let sui_sdk::rpc_types::ObjectChange::Created { object_id, version, digest, .. } = change {
-                    state.objects.push(TrackedObject {
-                        id: *object_id,
-                        version: version.value(),
-                        digest: *digest,
-                    });
+                    // Cap tracked objects to prevent memory bloat
+                    if state.objects.len() < MAX_TRACKED_OBJECTS_PER_WORKER {
+                        state.objects.push(TrackedObject {
+                            id: *object_id,
+                            version: version.value(),
+                            digest: *digest,
+                        });
+                    }
                     created_count += 1;
                 }
             }
@@ -814,11 +1258,14 @@ async fn execute_create_blob_batch(
         if let Some(changes) = &response.object_changes {
             for change in changes {
                 if let sui_sdk::rpc_types::ObjectChange::Created { object_id, version, digest, .. } = change {
-                    state.objects.push(TrackedObject {
-                        id: *object_id,
-                        version: version.value(),
-                        digest: *digest,
-                    });
+                    // Cap tracked objects to prevent memory bloat
+                    if state.objects.len() < MAX_TRACKED_OBJECTS_PER_WORKER {
+                        state.objects.push(TrackedObject {
+                            id: *object_id,
+                            version: version.value(),
+                            digest: *digest,
+                        });
+                    }
                     created_count += 1;
                 }
             }
