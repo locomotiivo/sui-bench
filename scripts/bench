@@ -1,1 +1,0 @@
-sudo bash -c 'nohup /home/femu/fdp-scripts/sui-bench/scripts/bench.sh > /home/femu/fdp-scripts/sui-bench/scripts/bench.log 2>&1 &'

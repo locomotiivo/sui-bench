@@ -2,14 +2,24 @@
 *.log
 results/
 scripts/results/
+scripts/logs/
+logs/
+
+# Binaries
+scripts/bench
+scripts/fdp_stats
 
 # cargo build artifacts
 target/
 .package_id
+Cargo.lock
 
 # Move build artifacts
 move/*/build/
-*.lock
+Move.lock
+*.localnet.toml
+*.devnet.toml
+*.testnet.toml
 
 # Editor and OS
 .DS_Store
